@@ -1,0 +1,14 @@
+{
+  "report_interval_min": 60,
+  "summary_window_min": 60,
+  "cap_gb": 5.0,
+  "cap_cooldown_min": 30,
+  "sample_interval_sec": 60,
+  "nethogs_delay_sec": 5,
+  "uplink_iface": "auto",
+  "panel_host": "0.0.0.0",
+  "panel_port": 8092,
+  "retention_days": 8,
+  "slack_channel": "",
+  "resolve_names": 1
+}

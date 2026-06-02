@@ -1,0 +1,40 @@
+[Unit]
+Description=marsad — host bandwidth observatory
+After=network-online.target docker.service
+Wants=network-online.target
+# Let a genuine crash-loop reach a terminal 'failed' state (5 crashes / 5 min).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/marsad/marsad.py
+EnvironmentFile=-/etc/marsad/marsad.env
+Restart=on-failure
+RestartSec=5
+
+# systemd provisions /var/lib/marsad (writable even under ProtectSystem=strict)
+# before ExecStart and exports $STATE_DIRECTORY.
+StateDirectory=marsad
+StateDirectoryMode=0750
+UMask=0077
+
+# Per-process attribution (nethogs/pcap) needs raw sockets + reading other users'
+# /proc/<pid> to map sockets->pids. Run as root but bound to only those caps, and
+# sandbox the filesystem so the admin panel can't be leveraged into broader access.
+User=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
