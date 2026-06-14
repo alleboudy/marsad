@@ -652,7 +652,15 @@ def _router_digest_block(lines, cfg, extras):
         lines.append(f"_(router unreachable — WAN stats stale/unavailable{extra})_")
     op, status = extras.get("operator", ""), extras.get("status", "")
     if op or status:
-        lines.append(f"carrier: {slack_escape(op) or '?'}   ·   link: {slack_escape(status) or '?'}")
+        net = extras.get("network_type") or ""
+        sig = extras.get("signal")
+        bits = [f"carrier: {slack_escape(op) or '?'}",
+                f"link: {slack_escape(status) or '?'}" + (f" {slack_escape(net)}" if net else "")]
+        if sig is not None:
+            bits.append(f"signal: {sig}/5")
+        if extras.get("router_today"):
+            bits.append(f"router today: {extras['router_today']}")
+        lines.append("   ·   ".join(bits))
     if extras.get("split_mode") == "estimated":
         lines.append("_(down/up split estimated from live speeds — total is exact)_")
     elif extras.get("split_mode") == "total_only":
@@ -1288,10 +1296,19 @@ class M7200Client:
                 raise AuthRejected(f"token rejected result={res}")
         return resp
 
+    # M7200 connectStatus / networkType code -> label (best-effort, raw fallback)
+    _CONN = {2: "connecting", 3: "disconnected", 4: "connected", 5: "disconnecting"}
+    _NET = {0: "no service", 1: "GSM", 2: "WCDMA", 3: "LTE", 4: "LTE", 5: "5G NSA", 6: "5G SA"}
+
     def get_status(self):
-        """Normalized WAN dict (fields are top-level on the M7200 status response)."""
+        """Normalized WAN + radio + battery dict from the M7200 status response."""
         resp = self.call("status", 0)
-        wan = resp.get("wan", resp) if isinstance(resp, dict) else {}
+        if not isinstance(resp, dict):
+            resp = {}
+        wan = resp.get("wan", resp)
+        bat = resp.get("battery") or {}
+        cs = _num(_first(wan, "connectStatus", "status"))
+        nt = _num(_first(wan, "networkType"))
         return {
             "rx": _num(_first(wan, "rxBytes", "totalRx", "rx")),
             "tx": _num(_first(wan, "txBytes", "totalTx", "tx")),
@@ -1300,7 +1317,18 @@ class M7200Client:
             "rx_speed": _num(_first(wan, "rxSpeed", "downSpeed")) or 0,
             "tx_speed": _num(_first(wan, "txSpeed", "upSpeed")) or 0,
             "operator": _first(wan, "operatorName", "operator", "isp") or "",
-            "status": _first(wan, "connectStatus", "status") or "",
+            "status": self._CONN.get(cs, str(cs) if cs is not None else ""),
+            "network_type": self._NET.get(nt, str(nt) if nt is not None else ""),
+            "signal": _num(_first(wan, "signalStrength")),       # 0..5 bars
+            "rsrp": _num(_first(wan, "rsrp")), "rssi": _num(_first(wan, "rssi")),
+            "snr": _num(_first(wan, "snr")), "band": _num(_first(wan, "band")),
+            "ipv4": _first(wan, "ipv4") or "",
+            "roaming": bool(_num(_first(wan, "roaming")) or 0),
+            "battery": ({"charging": bool(bat.get("charging")),
+                         "level": _num(_first(bat, "voltage", "level", "percent"))} if bat else None),
+            "device_count": _num(_first(resp.get("connectedDevices") or {}, "number")),
+            "model": _first(resp.get("deviceInfo") or {}, "model") or "",
+            "firmware": _first(resp.get("deviceInfo") or {}, "firmwareVer", "firmware") or "",
         }
 
     @staticmethod
@@ -1433,14 +1461,36 @@ class RouterCollector(Collector):
         win_secs = self.cfg["summary_window_min"] * 60
         wan_window = self._window_total(win_secs)
         residual = wan_window - sum(per_host.values())
+        # network "top talkers": instrumented host agents + the combined residual,
+        # ranked by bytes in the window (the M7200 has no per-device bytes, so
+        # non-agent devices can only be shown combined).
+        rows = [{"label": h, "bytes": b} for h, b in per_host.items()]
+        if residual > 0:
+            rows.append({"label": "other / uninstrumented devices (combined)", "bytes": residual})
+        rows.sort(key=lambda r: -r["bytes"])
+        tot = wan_window or sum(r["bytes"] for r in rows) or 1
+        talkers = [{"label": r["label"], "bytes": human(r["bytes"]),
+                    "pct": f"{r['bytes'] / tot * 100:.0f}"} for r in rows]
         return {
             "available": avail,
             "state": state,
             "split_mode": split,
+            # --- router data (radio + link + device) ---
             "operator": wan.get("operator", ""),
             "status": wan.get("status", ""),
+            "network_type": wan.get("network_type", ""),
+            "signal": wan.get("signal"),
+            "rsrp": wan.get("rsrp"), "rssi": wan.get("rssi"), "snr": wan.get("snr"),
+            "band": wan.get("band"), "ipv4": wan.get("ipv4", ""),
+            "roaming": wan.get("roaming", False),
+            "battery": wan.get("battery"),
+            "device_count": wan.get("device_count"),
+            "model": wan.get("model", ""), "firmware": wan.get("firmware", ""),
+            "router_today": human(wan["today"]) if wan.get("today") is not None else None,
+            # --- network usage ---
             "devices": [{"name": d.get("name", ""), "mac": d.get("mac", ""),
                          "ip": d.get("ip", "")} for d in devices],
+            "talkers": talkers,
             "per_host": per_host_list,
             "residual": human(residual) if per_host and residual > 0 else None,
         }
@@ -1747,13 +1797,17 @@ table{width:100%;border-collapse:collapse} td{padding:3px 0} .r{text-align:right
   <b>Top talkers</b> <span class=muted>(this window, est. share of WAN; <span id=attr></span>)</span>
   <table id=talkers></table>
 </div>
-<div class=card id=devicescard style=display:none>
-  <b>Connected devices</b> <span class=muted>(<span id=devcount></span> online · presence only — the router reports no per-device bytes)</span>
-  <table id=devices></table>
+<div class=card id=routercard style=display:none>
+  <b>Router</b> <span class=muted id=routerline></span>
+  <table id=routerinfo></table>
 </div>
 <div class=card id=hostscard style=display:none>
-  <b>Per-host usage</b> <span class=muted>(this window; instrumented hosts + combined "other")</span>
-  <table id=hosts></table>
+  <b>Top talkers (network)</b> <span class=muted>(this window; instrumented hosts ranked + combined "other" — the M7200 can't split non-agent devices)</span>
+  <table id=nettalkers></table>
+</div>
+<div class=card id=devicescard style=display:none>
+  <b>Connected devices</b> <span class=muted>(<span id=devcount></span> online · presence only — no per-device bytes from the router)</span>
+  <table id=devices></table>
 </div>
 <div class=card id=stopcard style=display:none>
   <b>Danger zone</b>
@@ -1807,6 +1861,7 @@ async function refresh(){
   let host = s.mode==='host';
   document.getElementById('stopcard').style.display = host ? '' : 'none';
   document.getElementById('talkerscard').style.display = host ? '' : 'none';
+  document.getElementById('routercard').style.display = host ? 'none' : '';
   document.getElementById('devicescard').style.display = host ? 'none' : '';
   document.getElementById('hostscard').style.display = host ? 'none' : '';
   setText('stopn', s.cfg.stop_top_n);
@@ -1824,13 +1879,28 @@ async function refresh(){
   for(const k in s.cfg){ let el=document.querySelector('[name='+k+']'); if(el&&el!==document.activeElement) el.value=s.cfg[k]; }
 }
 function renderRouter(r){
+  // router data card
+  setText('routerline', r.available===false ? '(unreachable'+(r.state==='LOCKED_OUT'?' — login disabled for safety':'')+')' : (r.model||''));
+  let ri = document.getElementById('routerinfo'); ri.replaceChildren();
+  function row(k,v){ if(v===undefined||v===null||v==='') return; let tr=ri.insertRow(); let a=tr.insertCell(); a.className='muted'; a.style.width='40%'; a.textContent=k; tr.insertCell().textContent=v; }
+  let sig = (r.signal!=null) ? (r.signal+'/5'+(r.rsrp!=null?'  ('+r.rsrp+' dBm RSRP':'')+(r.snr!=null?', SNR '+r.snr:'')+(r.rsrp!=null?')':'')) : null;
+  row('carrier', (r.operator||'')+(r.roaming?'  (roaming)':''));
+  row('link', r.status + (r.network_type?'  · '+r.network_type:'') + (r.band!=null?'  · band '+r.band:''));
+  row('signal', sig);
+  row('WAN IP', r.ipv4);
+  row('router total today', r.router_today);
+  row('devices online', r.device_count);
+  if(r.battery) row('battery', (r.battery.charging?'charging ':'')+(r.battery.level!=null?r.battery.level+'%':''));
+  row('firmware', r.firmware);
+  // network top talkers
+  let hb = document.getElementById('nettalkers'); hb.replaceChildren();
+  if(!(r.talkers||[]).length){ let td=hb.insertRow().insertCell(); td.className='muted'; td.textContent='no data yet (WAN window still filling)'; }
+  else for(const t of r.talkers){ let tr=hb.insertRow(); tr.insertCell().textContent=t.label; let c1=tr.insertCell(); c1.className='r'; c1.textContent=t.bytes; let c2=tr.insertCell(); c2.className='r'; c2.textContent=t.pct+'%'; }
+  // connected devices (presence)
   setText('devcount', (r.devices||[]).length);
   let db = document.getElementById('devices'); db.replaceChildren();
   if(!(r.devices||[]).length){ let td=db.insertRow().insertCell(); td.className='muted'; td.textContent=r.available===false?'router unreachable':'no devices'; }
   else for(const d of r.devices){ let tr=db.insertRow(); tr.insertCell().textContent=d.name||d.mac||d.ip||'?'; let c=tr.insertCell(); c.className='muted'; c.textContent=(d.ip||'')+(d.mac?'  '+d.mac:''); }
-  let hb = document.getElementById('hosts'); hb.replaceChildren();
-  for(const h of (r.per_host||[])){ let tr=hb.insertRow(); tr.insertCell().textContent=h.host; let c=tr.insertCell(); c.className='r'; c.textContent=h.total; }
-  if(r.residual){ let tr=hb.insertRow(); tr.insertCell().textContent='other / uninstrumented (combined)'; let c=tr.insertCell(); c.className='r'; c.textContent=r.residual; }
 }
 document.getElementById('stopbtn').onclick = async ()=>{
   if(!confirm('Kill the current top local consumers? Sends SIGTERM, then SIGKILL after the grace.')) return;
