@@ -146,41 +146,86 @@ def test_router_logic():
 
 
 def test_router_integration():
+    # A crypto-VERIFYING mock M7200: it RSA-decrypts the login `sign` and
+    # AES-decrypts the payload to validate the full handshake round-trip (the real
+    # wire protocol: {data:base64} requests, base64(json) responses, cookie token).
+    import hashlib
+    import re as _re
+    import subprocess
+    import tempfile
+    if not have("openssl"):
+        print("SKIP router integration (needs openssl)")
+        return
+    d = tempfile.mkdtemp()
+    pem = os.path.join(d, "k.pem")
+    subprocess.run(["openssl", "genrsa", "-out", pem, "512"], capture_output=True)
+    txt = subprocess.run(["openssl", "rsa", "-in", pem, "-noout", "-text"],
+                         capture_output=True, text=True).stdout
+    modhex = subprocess.run(["openssl", "rsa", "-in", pem, "-noout", "-modulus"],
+                            capture_output=True, text=True).stdout.strip().split("=")[1]
+    n = int(modhex, 16)
+    e = 65537
+    pd = _re.search(r"privateExponent:\s*\n((?:\s+[0-9a-f:]+\n)+)", txt).group(1)
+    priv_d = int(_re.sub(r"[^0-9a-f]", "", pd), 16)
+    klen = (n.bit_length() + 7) // 8
+    NONCE, PW, SEQ = "abc123", "s3cret", 5
     state = {"total": 1_000_000_000}
+
+    def rsa_dec(blob):  # decrypt concatenated PKCS#1 v1.5 blocks -> plaintext
+        out = b""
+        for i in range(0, len(blob), klen):
+            em = pow(int.from_bytes(blob[i:i + klen], "big"), priv_d, n).to_bytes(klen, "big")
+            out += em[em.find(b"\x00", 2) + 1:]
+        return out
+
+    import base64 as b64
     cls = m.M7200Client
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a): pass
-        def _j(self, o):
-            b = json.dumps(o).encode(); self.send_response(200)
-            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        def _send(self, obj):
+            body = b64.b64encode(json.dumps(obj).encode())
+            self.send_response(200); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-            if self.path == cls.AUTH and body.get("action") == 0:
-                return self._j({})
-            mod, act = body.get("module"), body.get("action")
-            if mod == "authenticator" and act == 1:
-                return self._j({"result": 0, "token": "t"} if body.get("password") == "s3cret" else {"result": 1})
-            if mod == "status":
-                return self._j({"wan": {"totalStatistics": state["total"], "rxSpeed": 300,
-                                        "txSpeed": 100, "operatorName": "MockNet", "connectStatus": "up"}})
-            if mod == "connectedDevices":
-                return self._j({"connectedDevices": [{"name": "P", "macAddr": "a1:b2:c3:d4:e5:f6",
-                                                      "ipAddr": "10.0.0.9"}]})
-            return self._j({})
+            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            if self.path == cls.AUTH:
+                if "sign" in req:  # login: verify the whole handshake
+                    kv = dict(p.split("=", 1) for p in rsa_dec(bytes.fromhex(req["sign"])).decode().split("&"))
+                    inner = json.loads(m.aes_cbc_decrypt(b64.b64decode(req["data"]),
+                                                         kv["key"].encode(), kv["iv"].encode()))
+                    ok = (kv["h"] == hashlib.md5(("admin" + PW).encode()).hexdigest()
+                          and inner.get("digest") == hashlib.md5((PW + ":" + NONCE).encode()).hexdigest()
+                          and int(kv["s"]) == SEQ + len(req["data"]))
+                    return self._send({"result": 0, "token": "tok"} if ok else {"result": -2})
+                return self._send({"result": 0, "nonce": NONCE, "rsaPubKey": format(e, "x"),
+                                   "rsaMod": modhex, "seqNum": SEQ})
+            if self.path == cls.WEB:
+                if "tpweb_token=tok" not in self.headers.get("Cookie", ""):
+                    return self._send({"result": -4})
+                mod = json.loads(b64.b64decode(req["data"]))["module"]
+                if mod == "status":
+                    return self._send({"totalStatistics": state["total"], "rxSpeed": 300,
+                                       "txSpeed": 100, "operatorName": "MockNet", "connectStatus": "up"})
+                if mod in ("wlan", "connectedDevices"):
+                    return self._send({"clientList": [{"name": "P", "macAddr": "a1:b2:c3:d4:e5:f6",
+                                                       "ipAddr": "10.0.0.9"}]})
+                return self._send({"result": 0})
+
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
-    rc = m.RouterCollector(dict(m.DEFAULTS, mode="network", router_host=f"127.0.0.1:{port}"))
+    rc = m.RouterCollector(dict(m.DEFAULTS, mode="network", router_host=f"127.0.0.1:{port}"),
+                           client=m.M7200Client(f"127.0.0.1:{port}", PW))
     rc._tick()
-    check("integration: legacy login ok", rc._state == "ACTIVE")
+    check("integration: full login handshake verified (RSA+AES round-trip)", rc._state == "ACTIVE")
     state["total"] += 2_000_000_000
     rc._tick()
-    d = rc.sample()[0]["WAN"]
-    check("integration: 2GB delta via real HTTP", d[0] + d[1] == 2_000_000_000)
-    check("integration: device parsed (tolerant fields)", rc.presence()[0]["mac"] == "A1:B2:C3:D4:E5:F6")
+    d2 = rc.sample()[0]["WAN"]
+    check("integration: 2GB WAN delta via real HTTP", d2[0] + d2[1] == 2_000_000_000)
+    check("integration: device parsed via wlan/clientList", rc.presence()[0]["mac"] == "A1:B2:C3:D4:E5:F6")
     try:
-        m.M7200Client(f"127.0.0.1:{port}", "wrong").login()
-        check("integration: bad pw raises", False)
+        m.M7200Client(f"127.0.0.1:{port}", "wrongpw").login()
+        check("integration: bad pw -> AuthRejected", False)
     except m.AuthRejected:
         check("integration: bad pw -> AuthRejected", True)
     srv.shutdown()

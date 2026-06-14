@@ -1174,32 +1174,37 @@ def _first(d, *keys):
 
 
 class M7200Client:
-    """Talks to a TP-Link M7200 (and firmware siblings). Holds ONE admin session
-    (token + AES key/iv) and reuses it — re-login evicts the family's app/browser,
-    so callers must avoid re-login storms. Encrypted (current firmware) with a
-    plaintext-legacy fallback. Wire framing is validated on hardware at install."""
+    """Talks to a TP-Link M7200. Protocol: requests are {"data": base64(json)}
+    (login additionally AES-encrypts its payload and RSA-signs key/iv/hash/seq),
+    responses are base64(json), and the session token is sent as the `tpweb_token`
+    cookie. Holds ONE admin session and reuses it — re-login evicts the family's
+    app/browser, so callers must avoid re-login storms."""
 
     AUTH = "/cgi-bin/auth_cgi"
     WEB = "/cgi-bin/web_cgi"
-    LEGACY = "/cgi-bin/qcmap_web_cgi"
+
+    # action ids for the authenticator module (load/login/getAttempt/logout/update)
+    A_LOAD, A_LOGIN, A_LOGOUT = 0, 1, 3
+    # modules to try for the connected-client list (firmware varies)
+    DEVICE_MODULES = ("wlan", "connectedDevices", "clientList", "deviceList", "client")
 
     def __init__(self, host, password, user="admin", timeout=12):
         self.base = f"http://{host}" if host and "://" not in host else (host or "")
         self.password = password or ""
         self.user = user or "admin"
         self.timeout = timeout
-        self._token = None
-        self._key = None
-        self._iv = None
-        self._legacy = False
+        self._token = None        # session token (sent as the tpweb_token cookie)
+        self._dev_module = None   # learned module that returns the client list
 
     # -- low-level HTTP ----------------------------------------------------- #
-    def _post(self, path, body, headers=None):
+    def _post(self, path, body, cookie=None):
         if not self.base:
             raise RouterUnreachable("no router_host configured")
         data = body if isinstance(body, (bytes, bytearray)) else body.encode()
-        req = urllib.request.Request(self.base + path, data=data,
-                                     headers=headers or {"Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = cookie
+        req = urllib.request.Request(self.base + path, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 return r.read().decode("utf-8", "replace")
@@ -1210,98 +1215,79 @@ class M7200Client:
         except Exception as e:  # noqa: BLE001  (timeout, refused, dns, reset, ...)
             raise RouterUnreachable(str(e))
 
-    def _decode_envelope(self, text):
-        """Parse a response that is either plain JSON or base64(AES(json))."""
+    @staticmethod
+    def _b64json(obj):
+        return base64.b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode()
+
+    def _decode(self, text, key=None, iv=None):
+        """Decode an M7200 response body: plain JSON, base64(JSON), or
+        base64(AES(JSON)) (the optional GDPR-mode login response)."""
         text = (text or "").strip()
         try:
             return json.loads(text)
         except Exception:  # noqa: BLE001
             pass
-        if self._key and self._iv:
+        try:
+            return json.loads(base64.b64decode(text))
+        except Exception:  # noqa: BLE001
+            pass
+        if key and iv:
             try:
-                ct = base64.b64decode(text)
-                pt = aes_cbc_decrypt(ct, self._key.encode(), self._iv.encode())
-                return json.loads(pt.decode("utf-8", "replace"))
+                return json.loads(aes_cbc_decrypt(base64.b64decode(text),
+                                                  key.encode(), iv.encode()))
             except Exception:  # noqa: BLE001
                 pass
         raise RouterUnreachable("undecodable response")
 
     # -- auth --------------------------------------------------------------- #
+    def _load(self):
+        """action 0: fetch nonce + RSA pubkey/mod + seqNum. No credentials."""
+        body = json.dumps({"data": self._b64json(
+            {"module": "authenticator", "action": self.A_LOAD})})
+        r = self._decode(self._post(self.AUTH, body))
+        return (_first(r, "nonce"), _first(r, "rsaPubKey"), _first(r, "rsaMod"),
+                _num(_first(r, "seqNum")) or 0)
+
     def login(self):
-        """Establish a session. Raises AuthRejected on bad creds, RouterUnreachable
-        on transient failure. On success caches token + AES key/iv."""
-        # Step 1: fetch nonce + RSA pubkey + seqNum (unencrypted).
-        r1 = self._decode_envelope(self._post(
-            self.AUTH, json.dumps({"module": "authenticator", "action": 0})))
-        nonce = _first(r1, "nonce", "Nonce")
-        rsa_e = _first(r1, "rsaPubKey", "ee", "e")
-        rsa_n = _first(r1, "rsaMod", "nn", "n")
-        seq = _num(_first(r1, "seqNum", "seq")) or 0
-        if not (nonce and rsa_e and rsa_n):
-            # No encrypted-handshake params -> try the legacy plaintext API.
-            return self._login_legacy()
-        e = int(str(rsa_e), 16)
-        n = int(str(rsa_n), 16)
-        self._key = _rand_ascii(16)
-        self._iv = _rand_ascii(16)
+        """Establish a session. Raises AuthRejected on bad creds / rejected login,
+        RouterUnreachable on transient failure. On success caches the token."""
+        nonce, ee, nn, seq = self._load()
+        if not (nonce and ee and nn):
+            raise RouterUnreachable("handshake params (nonce/rsa) missing")
+        key, iv = _rand_ascii(16), _rand_ascii(16)
         digest = _md5hex(f"{self.password}:{nonce}")
-        payload = json.dumps({"module": "authenticator", "action": 1, "digest": digest})
-        ct = base64.b64encode(aes_cbc_encrypt(payload.encode(), self._key.encode(),
-                                              self._iv.encode())).decode()
+        inner = json.dumps({"module": "authenticator", "action": self.A_LOGIN,
+                            "digest": digest}, separators=(",", ":"))
+        data = base64.b64encode(aes_cbc_encrypt(inner.encode(), key.encode(), iv.encode())).decode()
         h = _md5hex(self.user + self.password)
         sign = rsa_encrypt_pkcs1v15_hex(
-            f"key={self._key}&iv={self._iv}&h={h}&s={seq + len(ct)}".encode(), e, n)
-        r2 = self._decode_envelope(self._post(
-            self.AUTH, json.dumps({"data": ct, "sign": sign})))
-        result = _num(_first(r2, "result", "errorcode"))
-        if result == 0 and _first(r2, "token"):
-            self._token = _first(r2, "token")
-            self._legacy = False
-            return True
-        # result codes: 0 ok; nonzero is typically a credential/lockout signal.
-        raise AuthRejected(f"login result={result}")
-
-    def _login_legacy(self):
-        """Best-effort plaintext (older qcmap firmware). Validated on hardware."""
-        self._legacy = True
-        try:
-            r = self._decode_envelope(self._post(
-                self.LEGACY, json.dumps({"module": "authenticator", "action": 1,
-                                         "username": self.user, "password": self.password})))
-        except RouterUnreachable:
-            raise
+            f"key={key}&iv={iv}&h={h}&s={int(seq) + len(data)}".encode(),
+            int(str(ee), 16), int(str(nn), 16))
+        r = self._decode(self._post(self.AUTH, json.dumps({"data": data, "sign": sign})),
+                         key=key, iv=iv)
         result = _num(_first(r, "result", "errorcode"))
         tok = _first(r, "token")
-        if result == 0 or tok:
-            self._token = tok or "legacy"
+        if result == 0 and tok:
+            self._token = tok
             return True
-        raise AuthRejected(f"legacy login result={result}")
+        raise AuthRejected(f"login result={result}")  # nonzero => bad creds / locked
 
-    def call(self, module, action, extra=None):
+    def call(self, module, action):
+        """An authenticated web_cgi call: data is base64(JSON), token via cookie,
+        response is base64(JSON). Raises AuthRejected on an expired/rejected token."""
         if not self._token:
             raise AuthRejected("not logged in")
-        inner = {"token": self._token, "module": module, "action": action}
-        if extra:
-            inner.update(extra)
-        path = self.LEGACY if self._legacy else self.WEB
-        if self._legacy or not (self._key and self._iv):
-            body = json.dumps(inner)
-        else:
-            body = json.dumps({"token": self._token, "data": base64.b64encode(
-                aes_cbc_encrypt(json.dumps(inner).encode(), self._key.encode(),
-                                self._iv.encode())).decode()})
-        resp = self._decode_envelope(self._post(path, body))
-        # An expired/evicted token usually surfaces as a nonzero result here.
+        body = json.dumps({"data": self._b64json({"module": module, "action": action})})
+        resp = self._decode(self._post(self.WEB, body, cookie=f"tpweb_token={self._token}"))
         if isinstance(resp, dict):
             res = _num(_first(resp, "result", "errorcode"))
-            if res not in (None, 0) and ("token" in resp or "expire" in str(resp).lower()):
+            if res is not None and res < 0:   # -4 = not authenticated / token expired
                 self._token = None
                 raise AuthRejected(f"token rejected result={res}")
         return resp
 
     def get_status(self):
-        """Return a normalized WAN dict: rx/tx (bytes, if split), total (bytes),
-        rx_speed/tx_speed (B/s), today (bytes), operator, status."""
+        """Normalized WAN dict (fields are top-level on the M7200 status response)."""
         resp = self.call("status", 0)
         wan = resp.get("wan", resp) if isinstance(resp, dict) else {}
         return {
@@ -1311,26 +1297,48 @@ class M7200Client:
             "today": _num(_first(wan, "dailyStatistics", "todayBytes", "daily")),
             "rx_speed": _num(_first(wan, "rxSpeed", "downSpeed")) or 0,
             "tx_speed": _num(_first(wan, "txSpeed", "upSpeed")) or 0,
-            "operator": _first(wan, "operatorName", "operator") or "",
+            "operator": _first(wan, "operatorName", "operator", "isp") or "",
             "status": _first(wan, "connectStatus", "status") or "",
         }
 
-    def get_devices(self):
-        resp = self.call("connectedDevices", 0)
+    @staticmethod
+    def _extract_list(resp):
+        if isinstance(resp, list):
+            return resp
         if isinstance(resp, dict):
-            for k in ("connectedDevices", "clientList", "deviceList", "hosts", "list"):
+            for k in ("connectedDevices", "clientList", "deviceList", "hosts",
+                      "list", "stationList", "clients"):
                 if isinstance(resp.get(k), list):
                     return resp[k]
             for v in resp.values():
                 if isinstance(v, list) and v and isinstance(v[0], dict):
                     return v
-        return resp if isinstance(resp, list) else []
+        return []
+
+    def get_devices(self):
+        """Connected-client list. The module varies by firmware, so try a few and
+        remember the one that yields a list."""
+        mods = ([self._dev_module] if self._dev_module else []) + list(self.DEVICE_MODULES)
+        for mod in mods:
+            if not mod:
+                continue
+            try:
+                lst = self._extract_list(self.call(mod, 0))
+            except AuthRejected:
+                raise
+            except Exception:  # noqa: BLE001
+                continue
+            if lst:
+                self._dev_module = mod
+                return lst
+        return []
 
     def logout(self):
         if self._token:
             try:
-                self._post(self.AUTH, json.dumps(
-                    {"token": self._token, "module": "authenticator", "action": 3}))
+                self._post(self.WEB, json.dumps({"data": self._b64json(
+                    {"module": "authenticator", "action": self.A_LOGOUT})}),
+                    cookie=f"tpweb_token={self._token}")
             except Exception:  # noqa: BLE001
                 pass
             self._token = None
