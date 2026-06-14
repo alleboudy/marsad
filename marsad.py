@@ -38,16 +38,21 @@ Stdlib only. `nethogs` is optional: without it the tool still reports interface
 totals, just without the per-process breakdown.
 """
 
+import base64
+import hashlib
 import http.server
 import json
 import os
 import re
+import secrets
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -58,6 +63,7 @@ DB_PATH = os.path.join(STATE_DIR, "marsad.db")
 ENV_FILE = os.environ.get("MARSAD_ENV", "/etc/marsad/marsad.env")
 
 DEFAULTS = {
+    "mode": "host",                # "host" (NIC + nethogs) or "router"/"network" (poll a gateway) (restart)
     "report_interval_min": 60,     # how often a digest is sent (live)
     "summary_window_min": 60,      # how much history each digest + the cap covers (live)
     "cap_gb": 5.0,                 # alert if the summary window exceeds this many GB (0 = off, live)
@@ -70,11 +76,30 @@ DEFAULTS = {
     "retention_days": 8,           # prune samples older than this (live)
     "slack_channel": "",           # overrides MARSAD_SLACK_CHANNEL when set (live)
     "resolve_names": 1,            # reverse-DNS endpoint IPs to hostnames (1=on, 0=off, live)
+    "projection_window_min": 5,    # rate basis for the projected next-1h figure (live)
+    "graph_window_min": 120,       # time span shown in the panel SVG rate graph (live)
+    "stop_top_n": 3,               # how many top WAN PIDs the stop-top button targets (host, live)
+    "stop_grace_sec": 8,           # SIGTERM->SIGKILL grace for stop-top (host, live)
+    "protected_procs": [],         # extra process-name substrings stop-top must never kill (config.json, hot-reloaded)
+    # --- router/network mode (mode="router"/"network"): poll a gateway router -----
+    "router_host": "",             # router IP/hostname, e.g. 192.168.0.1 (restart)
+    "router_iface_label": "WAN",   # synthetic interface name for the router's uplink (restart)
+    "router_poll_sec": 30,         # how often the router HTTP API is polled (live)
+    "router_auth_fail_limit": 2,   # consecutive credential rejections before locking out (live)
+    "router_lockout_backoff_min": 240,  # long backoff after a credential lockout (live)
+    "router_net_backoff_max_sec": 600,  # cap for transient-error exponential backoff (live)
+    "router_reauth_cooldown_sec": 120,  # min gap before re-grabbing the single admin slot (live)
+    "router_max_delta_mb": 0,      # clamp any single WAN delta to this many MB (0 = off, live)
+    "agent_endpoints": [],         # marsad host-instance URLs to aggregate per-host (restart)
+    "device_names": {},            # MAC -> friendly name for the presence list (config.json, hot-reloaded)
 }
 
 INTRAHOST_PREFIXES = ("lo", "docker", "br-", "veth", "tailscale")
 LIVE_KEYS = ("report_interval_min", "summary_window_min", "cap_gb",
-             "cap_cooldown_min", "sample_interval_sec", "resolve_names")
+             "cap_cooldown_min", "sample_interval_sec", "resolve_names",
+             "projection_window_min", "graph_window_min", "stop_top_n", "stop_grace_sec",
+             "router_poll_sec", "router_auth_fail_limit", "router_lockout_backoff_min",
+             "router_net_backoff_max_sec", "router_reauth_cooldown_sec", "router_max_delta_mb")
 IFACE_RE = re.compile(r"auto|[A-Za-z0-9_.][A-Za-z0-9._-]{0,14}")
 HOST_RE = re.compile(r"[A-Za-z0-9.:_-]{1,45}")
 
@@ -88,6 +113,16 @@ CLAMP = {
     "panel_port": (1, 65535),
     "retention_days": (1, 365),
     "resolve_names": (0, 1),
+    "projection_window_min": (1, 60),
+    "graph_window_min": (5, 1440),
+    "stop_top_n": (1, 20),
+    "stop_grace_sec": (1, 60),
+    "router_poll_sec": (10, 3600),
+    "router_auth_fail_limit": (1, 5),
+    "router_lockout_backoff_min": (5, 1440),
+    "router_net_backoff_max_sec": (30, 3600),
+    "router_reauth_cooldown_sec": (0, 3600),
+    "router_max_delta_mb": (0, 1000000),
 }
 
 _log_lock = threading.Lock()
@@ -135,6 +170,30 @@ def load_config():
         cfg["panel_host"] = DEFAULTS["panel_host"]
     sc = cfg.get("slack_channel", "")
     cfg["slack_channel"] = sc if isinstance(sc, str) and (sc == "" or re.fullmatch(r"[A-Za-z0-9]{6,24}", sc)) else ""
+    if cfg.get("mode") not in ("host", "router", "network"):
+        cfg["mode"] = "host"
+    pp = cfg.get("protected_procs", [])
+    if isinstance(pp, str):
+        pp = [pp]
+    if not isinstance(pp, list):
+        pp = []
+    cfg["protected_procs"] = [str(p)[:64] for p in pp
+                              if isinstance(p, (str, int)) and str(p).strip()][:128]
+    rh = cfg.get("router_host", "")
+    cfg["router_host"] = rh if isinstance(rh, str) and (rh == "" or HOST_RE.fullmatch(rh)) else ""
+    rl = cfg.get("router_iface_label", "WAN")
+    cfg["router_iface_label"] = rl if isinstance(rl, str) and IFACE_RE.fullmatch(rl) else "WAN"
+    ae = cfg.get("agent_endpoints", [])
+    if not isinstance(ae, list):
+        ae = []
+    cfg["agent_endpoints"] = [u for u in (str(x).strip() for x in ae)
+                              if re.fullmatch(r"https?://[A-Za-z0-9.:_-]{1,80}", u)][:32]
+    dn = cfg.get("device_names", {})
+    if not isinstance(dn, dict):
+        dn = {}
+    cfg["device_names"] = {str(k).upper()[:17]: str(v)[:48]
+                           for k, v in list(dn.items())[:256]
+                           if re.fullmatch(r"[0-9A-Fa-f:.\-]{12,17}", str(k))}
     return cfg
 
 
@@ -392,8 +451,12 @@ class Store:
     def __init__(self, path):
         self.lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA wal_autocheckpoint=200")
+        # fetchall() consumes each PRAGMA's result row so the statement is finalized;
+        # an unconsumed PRAGMA cursor leaves a read lock that makes the first write
+        # fail with SQLITE_LOCKED ("database table is locked") on some platforms.
+        self.db.execute("PRAGMA journal_mode=WAL").fetchall()
+        self.db.execute("PRAGMA busy_timeout=5000").fetchall()  # wait on lock contention
+        self.db.execute("PRAGMA wal_autocheckpoint=200").fetchall()
         self.db.execute("CREATE TABLE IF NOT EXISTS iface (ts INTEGER, iface TEXT, rx INTEGER, tx INTEGER)")
         self.db.execute("CREATE TABLE IF NOT EXISTS proc (ts INTEGER, label TEXT, w_sent REAL, w_recv REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v REAL)")
@@ -456,6 +519,23 @@ class Store:
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self.db.commit()
 
+    def series(self, iface, since, buckets=80):
+        """Bucket an iface's deltas into `buckets` equal time bins between `since`
+        and now. Returns (bins=[[rx,tx], ...], bin_width_sec) for the SVG graph."""
+        now = int(time.time())
+        width = max(1.0, (now - since) / buckets)
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT ts, rx, tx FROM iface WHERE iface=? AND ts>=? ORDER BY ts",
+                (iface, since)).fetchall()
+        bins = [[0, 0] for _ in range(buckets)]
+        for ts, rx, tx in rows:
+            i = int((ts - since) / width)
+            i = 0 if i < 0 else (buckets - 1 if i >= buckets else i)
+            bins[i][0] += rx or 0
+            bins[i][1] += tx or 0
+        return bins, width
+
 
 # --------------------------------------------------------------------------- #
 # Formatting + Slack
@@ -467,6 +547,48 @@ def human(n):
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} TB"
+
+
+def projection_1h(store, iface, window_min):
+    """Projected next-hour consumption = average rate over the last `window_min`
+    × 3600. Returns {"rx","tx","total"} in bytes (0 if no traffic/target)."""
+    if not iface:
+        return {"rx": 0.0, "tx": 0.0, "total": 0.0}
+    since = int(time.time()) - window_min * 60
+    rx, tx = store.iface_totals(since).get(iface, (0, 0))
+    secs = max(1, window_min * 60)
+    return {"rx": rx / secs * 3600, "tx": tx / secs * 3600, "total": (rx + tx) / secs * 3600}
+
+
+def render_svg(bins, width_sec, w=620, h=120, pad=4):
+    """Render a stdlib-only inline SVG sparkline of download/upload *rates* from
+    Store.series() bins. No JS libraries. All text is XML-escaped."""
+    n = len(bins) or 1
+    rx_rate = [(b[0] / width_sec) for b in bins]
+    tx_rate = [(b[1] / width_sec) for b in bins]
+    peak = max([1.0] + rx_rate + tx_rate)
+    plot_h = h - 2 * pad
+    step = (w - 2 * pad) / max(1, n - 1)
+
+    def pts(series):
+        out = []
+        for i, v in enumerate(series):
+            x = pad + i * step
+            y = pad + plot_h - (v / peak) * plot_h
+            out.append(f"{x:.1f},{y:.1f}")
+        return " ".join(out)
+
+    label = slack_escape(human(peak) + "/s peak")
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}" role="img" aria-label="traffic rate graph">'
+        f'<rect x="0" y="0" width="{w}" height="{h}" fill="#fafafa" stroke="#e5e5e5"/>'
+        f'<polyline fill="none" stroke="#2563eb" stroke-width="1.5" points="{pts(rx_rate)}"/>'
+        f'<polyline fill="none" stroke="#dc2626" stroke-width="1.5" points="{pts(tx_rate)}"/>'
+        f'<text x="{pad+2}" y="{pad+11}" font="11px sans-serif" font-size="11" '
+        f'fill="#888">{label}  ·  ⬇ blue  ⬆ red</text>'
+        f"</svg>"
+    )
 
 
 def post_slack(text, channel=None):
@@ -499,19 +621,7 @@ def midnight_epoch():
     return int(datetime(now.year, now.month, now.day).timestamp())
 
 
-def build_digest(store, cfg, uplink, window_min):
-    since = int(time.time()) - window_min * 60
-    iface = store.iface_totals(since)
-    up_rx, up_tx = iface.get(uplink, (0, 0))
-
-    lines = [f"*{HOST} bandwidth* — last {window_min} min"]
-    lines.append(f"WAN ({uplink}):  ⬇ {human(up_rx)} down   ⬆ {human(up_tx)} up   "
-                 f"Σ {human(up_rx + up_tx)} total")
-
-    day = store.iface_totals(midnight_epoch()).get(uplink, (0, 0))
-    lines.append(f"today so far:  ⬇ {human(day[0])} down   ⬆ {human(day[1])} up   "
-                 f"Σ {human(day[0] + day[1])} total")
-
+def _host_digest_block(lines, store, cfg, uplink, iface, since, up_rx, up_tx):
     others = [(i, v) for i, v in iface.items()
               if i != uplink and not is_intrahost(i) and (v[0] + v[1]) > 1024 * 1024]
     if others:
@@ -534,6 +644,62 @@ def build_digest(store, cfg, uplink, window_min):
     elif not talkers:
         lines.append("_(per-process breakdown unavailable — nethogs not running)_")
 
+
+def _router_digest_block(lines, cfg, extras):
+    if extras.get("available") is False:
+        st = extras.get("state", "")
+        extra = " (login disabled for safety)" if st == "LOCKED_OUT" else ""
+        lines.append(f"_(router unreachable — WAN stats stale/unavailable{extra})_")
+    op, status = extras.get("operator", ""), extras.get("status", "")
+    if op or status:
+        lines.append(f"carrier: {slack_escape(op) or '?'}   ·   link: {slack_escape(status) or '?'}")
+    if extras.get("split_mode") == "estimated":
+        lines.append("_(down/up split estimated from live speeds — total is exact)_")
+    elif extras.get("split_mode") == "total_only":
+        lines.append("_(router reports a single WAN total — no down/up split)_")
+
+    devices = extras.get("devices", [])
+    if devices:
+        shown = [slack_escape(d.get("name") or d.get("mac") or d.get("ip") or "?")
+                 for d in devices[:8]]
+        more = f" · +{len(devices) - 8} more" if len(devices) > 8 else ""
+        lines.append(f"{len(devices)} devices online: " + " · ".join(shown) + more)
+
+    per_host = extras.get("per_host", [])
+    if per_host:
+        lines.append("per-host (instrumented agents, this window):")
+        for h in per_host:
+            lines.append(f"  • {slack_escape(h['host'])}: {h['total']}")
+        if extras.get("residual"):
+            lines.append(f"  • other / uninstrumented devices (combined): {extras['residual']}")
+    lines.append("_(the M7200 reports no per-device byte counters — usage can't be split by "
+                 "device; only presence + per-agent-host totals are shown)_")
+
+
+def build_digest(store, cfg, uplink, window_min, extras=None):
+    since = int(time.time()) - window_min * 60
+    iface = store.iface_totals(since)
+    up_rx, up_tx = iface.get(uplink, (0, 0))
+    router = cfg["mode"] in ("router", "network")
+    scope = "M7200, whole network" if router else uplink
+
+    lines = [f"*{HOST} bandwidth* — last {window_min} min"]
+    lines.append(f"WAN ({scope}):  ⬇ {human(up_rx)} down   ⬆ {human(up_tx)} up   "
+                 f"Σ {human(up_rx + up_tx)} total")
+
+    day = store.iface_totals(midnight_epoch()).get(uplink, (0, 0))
+    lines.append(f"today so far:  ⬇ {human(day[0])} down   ⬆ {human(day[1])} up   "
+                 f"Σ {human(day[0] + day[1])} total")
+
+    pj = projection_1h(store, uplink, cfg["projection_window_min"])
+    lines.append(f"projected next 1h (at last {cfg['projection_window_min']}m rate):  "
+                 f"Σ {human(pj['total'])}")
+
+    if router:
+        _router_digest_block(lines, cfg, extras or {})
+    else:
+        _host_digest_block(lines, store, cfg, uplink, iface, since, up_rx, up_tx)
+
     if cfg["report_interval_min"] != window_min:
         rel = "overlap between reports" if cfg["report_interval_min"] < window_min \
             else "gaps between report windows not shown"
@@ -542,36 +708,73 @@ def build_digest(store, cfg, uplink, window_min):
 
 
 # --------------------------------------------------------------------------- #
-# Daemon
+# Collectors — each produces (iface_deltas, attribution_weights) per cycle, so the
+# Store / cap / digest / panel machinery is identical regardless of data source.
 # --------------------------------------------------------------------------- #
-class Daemon:
-    def __init__(self):
-        if not os.path.isdir(STATE_DIR):
-            os.makedirs(STATE_DIR, exist_ok=True)
-        self.cfg = load_config()
+class Collector:
+    """A source of per-cycle traffic samples.
+
+    sample() returns (iface_deltas, attribution) — exactly the two dicts
+    Store.add_sample takes: {iface: (rx_delta, tx_delta)} and
+    {label: (w_sent, w_recv)}. target_label() is the interface the cap/digest/panel
+    focus on. presence()/extras() carry mode-specific context for the digest + panel.
+    """
+    available = None
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def target_label(self):
+        return None
+
+    def sample(self):
+        return {}, {}
+
+    def retarget(self, cfg):
+        pass
+
+    def presence(self):
+        return []
+
+    def extras(self):
+        return {}
+
+
+class HostCollector(Collector):
+    """The original behaviour: /proc/net/dev per-interface deltas + nethogs
+    per-process attribution on the default-route (or configured) uplink."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
         self.uplink = self._resolve_uplink()
-        log(f"host={HOST} uplink={self.uplink}")
-        self.store = Store(DB_PATH)
         self.labeler = Labeler()
-        self.nethogs = NethogsReader(self.uplink or "lo", self.cfg["nethogs_delay_sec"])
-        if self.uplink:
-            self.nethogs.start()
+        self.nethogs = NethogsReader(self.uplink or "lo", cfg["nethogs_delay_sec"])
         self._last_counters = read_proc_net_dev()
-        self._last_report = self.store.get_meta("last_report", 0.0)
-        self._last_cap_alert = self.store.get_meta("last_cap_alert", 0.0)
-        self._last_prune = 0.0
-        self._stop = threading.Event()
-        dest = self.cfg.get("slack_channel") or env_value("MARSAD_SLACK_CHANNEL")
-        if not env_value("MARSAD_SLACK_TOKEN") or not dest:
-            log("WARNING slack token/channel not configured — digests + cap alerts will NOT send")
-        else:
-            log(f"slack destination: {dest}")
+        self._started = False
+        self._pid_acc = {}      # (path, pid:int) -> [w_sent, w_recv], decayed each cycle
 
     def _resolve_uplink(self):
         return detect_uplink() if self.cfg["uplink_iface"] == "auto" else self.cfg["uplink_iface"]
 
+    @property
+    def available(self):
+        return self.nethogs.available
+
+    def start(self):
+        if self.uplink and not self._started:
+            self.nethogs.start()
+            self._started = True
+
+    def stop(self):
+        self.nethogs.stop()
+
+    def target_label(self):
+        return self.uplink
+
     def sample(self):
-        ts = int(time.time())
         cur = read_proc_net_dev()
         deltas = {}
         for iface, (rx, tx) in cur.items():
@@ -588,29 +791,854 @@ class Daemon:
                 deltas[iface] = (drx, dtx)
         self._last_counters = cur
 
+        drained = self.nethogs.drain()
         proc_weights = {}
-        for (path, pid), (ws, wr) in self.nethogs.drain().items():
+        for (path, pid), (ws, wr) in drained.items():
             label = self.labeler.label(path, pid)
             agg = proc_weights.setdefault(label, [0.0, 0.0])
             agg[0] += ws
             agg[1] += wr
 
-        self.store.add_sample(ts, deltas, proc_weights)
-        return ts
+        self._retain_pids(drained)
+        return deltas, proc_weights
 
-    def maybe_retarget(self):
+    _PID_DECAY = 0.5
+
+    def _retain_pids(self, drained):
+        """Keep a decaying per-PID byte map so stop-top can target *current* heavy
+        local processes. Only real local processes (abs path + numeric pid) qualify;
+        endpoint pseudo-entries (no killable local pid) are ignored."""
+        for k in list(self._pid_acc):
+            a = self._pid_acc[k]
+            a[0] *= self._PID_DECAY
+            a[1] *= self._PID_DECAY
+            if a[0] + a[1] < 1.0:
+                del self._pid_acc[k]
+        for (path, pid), (ws, wr) in drained.items():
+            if path.startswith("/") and str(pid).isdigit() and int(pid) > 1:
+                a = self._pid_acc.setdefault((path, int(pid)), [0.0, 0.0])
+                a[0] += ws
+                a[1] += wr
+
+    def top_pids(self, n):
+        """Current heaviest local PIDs: [(pid:int, name, bytes), ...] desc."""
+        items = sorted(self._pid_acc.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))
+        out = []
+        for (path, pid), (ws, wr) in items[:max(0, n)]:
+            out.append((pid, os.path.basename(path) or path, ws + wr))
+        return out
+
+    def retarget(self, cfg):
+        self.cfg = cfg
         want = self._resolve_uplink()
         if not want:
             if not self.uplink:
                 log("uplink still unresolved (no default route yet)")
             return
-        if want != self.uplink or self.cfg["nethogs_delay_sec"] != self.nethogs.delay:
+        if want != self.uplink or cfg["nethogs_delay_sec"] != self.nethogs.delay:
             log(f"re-targeting capture: {self.uplink} -> {want} "
-                f"(delay {self.nethogs.delay}->{self.cfg['nethogs_delay_sec']}s)")
+                f"(delay {self.nethogs.delay}->{cfg['nethogs_delay_sec']}s)")
             self.nethogs.stop()
             self.uplink = want
-            self.nethogs = NethogsReader(want, self.cfg["nethogs_delay_sec"])
+            self.nethogs = NethogsReader(want, cfg["nethogs_delay_sec"])
             self.nethogs.start()
+            self._started = True
+
+
+def make_collector(cfg):
+    """Pick the collector for the configured mode. Router mode falls back to host
+    if RouterCollector isn't present (it's defined further down for router builds)."""
+    mode = cfg.get("mode", "host")
+    if mode in ("router", "network"):
+        rc = globals().get("RouterCollector")
+        if rc is not None:
+            return rc(cfg)
+        log("WARNING mode=router set but RouterCollector unavailable — using host mode")
+    return HostCollector(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# Stop-top — kill the heaviest local consumers (host mode only). Hard-gated: it only
+# ever targets the daemon-computed top PIDs, never a caller-supplied pid, and an
+# allowlist protects critical processes (checked again at kill time).
+# --------------------------------------------------------------------------- #
+PROTECT_COMM = {"systemd", "init", "sshd", "dockerd", "containerd"}  # exact comm
+PROTECT_TOKENS = ("marsad",)  # substring — never kill a sibling marsad instance
+
+
+def proc_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_protected(pid, extra=()):
+    """True if `pid` must never be killed. Evaluated fresh (reads /proc) at call
+    time so a PID recycled into a protected process is still safe."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 1 or pid == os.getpid():
+        return True
+    try:
+        if os.getpgid(pid) == os.getpgrp():  # our own process group
+            return True
+    except Exception:  # noqa: BLE001
+        return True  # can't determine -> refuse to kill
+    comm = proc_comm(pid)
+    if not comm or comm in PROTECT_COMM:
+        return True
+    # token match is against comm + the FULL cmdline (lowercased), so allowlist
+    # entries catch processes whose comm is generic (python3/node) but whose
+    # cmdline identifies critical infra (CI runners, ci-* containers, the LLM stack).
+    hay = (comm + " " + proc_cmdline(pid)).lower()
+    for tok in PROTECT_TOKENS:
+        if tok in hay:
+            return True
+    for tok in extra:
+        t = str(tok).strip().lower()
+        if t and t in hay:
+            return True
+    return False
+
+
+def stop_top_consumers(collector, n, grace, extra=()):
+    """SIGTERM (then SIGKILL after `grace`) the daemon-computed top-N local PIDs,
+    skipping anything is_protected(). Returns a JSON-able report. Host mode only."""
+    if not isinstance(collector, HostCollector):
+        return {"ok": False, "error": "stop-top is only available in host mode"}
+
+    def safe_to_kill(t):
+        # Re-evaluated before EVERY signal: never kill a protected process, and
+        # bail if the PID was recycled into a different process (comm changed)
+        # between selection and now — closes the PID-reuse TOCTOU window.
+        return (not is_protected(t["pid"], extra)) and proc_comm(t["pid"]) == t["comm"]
+
+    targets = collector.top_pids(n)
+    to_kill, skipped = [], []
+    for pid, name, by in targets:
+        comm = proc_comm(pid)
+        if is_protected(pid, extra) or not comm:
+            skipped.append({"pid": pid, "name": name, "reason": "protected"})
+        else:
+            to_kill.append({"pid": pid, "name": name, "comm": comm, "bytes": int(by)})
+    for t in to_kill:
+        try:
+            if safe_to_kill(t):
+                os.kill(t["pid"], signal.SIGTERM)
+                t["signal"] = "TERM"
+            else:
+                t["signal"] = "skipped-protected"
+        except ProcessLookupError:
+            t["signal"] = "already-gone"
+        except Exception as e:  # noqa: BLE001
+            t["signal"] = f"error:{e}"
+    if any(t.get("signal") == "TERM" for t in to_kill):
+        time.sleep(max(0, min(60, grace)))
+    for t in to_kill:
+        if t.get("signal") == "TERM" and pid_alive(t["pid"]):
+            try:
+                if safe_to_kill(t):  # identity + allowlist re-checked at SIGKILL time
+                    os.kill(t["pid"], signal.SIGKILL)
+                    t["signal"] = "KILL"
+                else:
+                    t["signal"] = "TERM-then-recycled"
+            except ProcessLookupError:
+                t["signal"] = "TERM-then-gone"
+            except Exception as e:  # noqa: BLE001
+                t["signal"] = f"error:{e}"
+    log(f"stop-top: killed={[t['pid'] for t in to_kill]} skipped={[s['pid'] for s in skipped]}")
+    return {"ok": True, "killed": to_kill, "skipped": skipped}
+
+
+# --------------------------------------------------------------------------- #
+# Crypto (stdlib only) — for the TP-Link M7200 encrypted admin API.
+# AES-128-CBC + RSA PKCS#1 v1.5. The primitives are verified against FIPS-197 and
+# OpenSSL; the exact M7200 *wire framing* (field names, hex/base64) is confirmed on
+# real hardware at install time — see M7200Client and the README "router mode" notes.
+# --------------------------------------------------------------------------- #
+def _rotl8(x, s):
+    return ((x << s) | (x >> (8 - s))) & 0xFF
+
+
+def _gen_sbox():
+    """Generate the AES S-box (FIPS-197) programmatically to avoid transcription
+    errors (the affine step uses byte rotation, ROTL8). Verified at import against
+    the known fixed point S-box[0]=0x63 and at test time against FIPS-197 vectors."""
+    p = q = 1
+    sbox = bytearray(256)
+    while True:
+        p = (p ^ (p << 1) ^ (0x1B if p & 0x80 else 0)) & 0xFF
+        q ^= (q << 1) & 0xFF
+        q ^= (q << 2) & 0xFF
+        q ^= (q << 4) & 0xFF
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        q &= 0xFF
+        x = q ^ _rotl8(q, 1) ^ _rotl8(q, 2) ^ _rotl8(q, 3) ^ _rotl8(q, 4)
+        sbox[p] = (x ^ 0x63) & 0xFF
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return bytes(sbox)
+
+
+_SBOX = _gen_sbox()
+_INV_SBOX = bytes(_SBOX.index(i) for i in range(256))
+_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _gmul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return r
+
+
+def _key_expansion(key):
+    w = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = t[1:] + t[:1]
+            t = [_SBOX[b] for b in t]
+            t[0] ^= _RCON[i // 4 - 1]
+        w.append([w[i - 4][j] ^ t[j] for j in range(4)])
+    return [bytes(b for word in w[r * 4:r * 4 + 4] for b in word) for r in range(11)]
+
+
+def _shift_rows(s, inv=False):
+    o = bytearray(16)
+    for r in range(4):
+        for c in range(4):
+            src = (c - r) % 4 if inv else (c + r) % 4
+            o[r + 4 * c] = s[r + 4 * src]
+    return bytes(o)
+
+
+def _mix_columns(s, inv=False):
+    o = bytearray(16)
+    m = (14, 11, 13, 9) if inv else (2, 3, 1, 1)
+    for c in range(4):
+        col = s[4 * c:4 * c + 4]
+        for r in range(4):
+            o[4 * c + r] = (_gmul(col[0], m[(0 - r) % 4]) ^ _gmul(col[1], m[(1 - r) % 4])
+                            ^ _gmul(col[2], m[(2 - r) % 4]) ^ _gmul(col[3], m[(3 - r) % 4]))
+    return bytes(o)
+
+
+def _add_round_key(s, rk):
+    return bytes(s[i] ^ rk[i] for i in range(16))
+
+
+def _encrypt_block(b, rks):
+    s = _add_round_key(b, rks[0])
+    for rnd in range(1, 10):
+        s = bytes(_SBOX[x] for x in s)
+        s = _shift_rows(s)
+        s = _mix_columns(s)
+        s = _add_round_key(s, rks[rnd])
+    s = bytes(_SBOX[x] for x in s)
+    s = _shift_rows(s)
+    return _add_round_key(s, rks[10])
+
+
+def _decrypt_block(b, rks):
+    s = _add_round_key(b, rks[10])
+    for rnd in range(9, 0, -1):
+        s = _shift_rows(s, inv=True)
+        s = bytes(_INV_SBOX[x] for x in s)
+        s = _add_round_key(s, rks[rnd])
+        s = _mix_columns(s, inv=True)
+    s = _shift_rows(s, inv=True)
+    s = bytes(_INV_SBOX[x] for x in s)
+    return _add_round_key(s, rks[0])
+
+
+def aes_cbc_encrypt(data, key, iv):
+    rks = _key_expansion(key)
+    pad = 16 - (len(data) % 16)
+    data = data + bytes([pad]) * pad
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), 16):
+        blk = bytes(a ^ b for a, b in zip(data[i:i + 16], prev))
+        prev = _encrypt_block(blk, rks)
+        out += prev
+    return bytes(out)
+
+
+def aes_cbc_decrypt(data, key, iv):
+    if not data or len(data) % 16 != 0:
+        raise ValueError("ciphertext not a multiple of the AES block size")
+    rks = _key_expansion(key)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), 16):
+        blk = data[i:i + 16]
+        out += bytes(a ^ b for a, b in zip(_decrypt_block(blk, rks), prev))
+        prev = blk
+    pad = out[-1]
+    # full PKCS#7 validation: every padding byte must equal the count.
+    if pad < 1 or pad > 16 or any(b != pad for b in out[-pad:]):
+        raise ValueError("invalid PKCS#7 padding")
+    return bytes(out[:-pad])
+
+
+def rsa_encrypt_pkcs1v15_hex(msg, e, n):
+    """RSA PKCS#1 v1.5 type-2 (encryption) of `msg`, chunked across blocks the way
+    the TP-Link web UI does, concatenated and hex-encoded. Public key only."""
+    k = (n.bit_length() + 7) // 8
+    maxm = k - 11
+    if maxm <= 0:
+        raise ValueError("RSA modulus too small")
+    out = bytearray()
+    for i in range(0, len(msg) or 1, maxm):
+        chunk = msg[i:i + maxm]
+        ps = bytearray()
+        while len(ps) < k - 3 - len(chunk):
+            b = secrets.token_bytes(1)
+            if b != b"\x00":
+                ps += b
+        em = b"\x00\x02" + bytes(ps) + b"\x00" + chunk
+        c = pow(int.from_bytes(em, "big"), e, n)
+        out += c.to_bytes(k, "big")
+    return out.hex()
+
+
+def _md5hex(s):
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def _rand_ascii(n):
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+# --------------------------------------------------------------------------- #
+# TP-Link M7200 admin-API client
+# --------------------------------------------------------------------------- #
+class AuthRejected(Exception):
+    """The router rejected our credentials (do NOT retry-loop — lockout risk)."""
+
+
+class RouterUnreachable(Exception):
+    """Transient failure: timeout / refused / garbage / token expired."""
+
+
+def _num(v):
+    """Coerce a router field (often a numeric string) to int bytes; None if absent."""
+    if v is None:
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(d, *keys):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) not in (None, ""):
+            return d[k]
+    return None
+
+
+class M7200Client:
+    """Talks to a TP-Link M7200. Protocol: requests are {"data": base64(json)}
+    (login additionally AES-encrypts its payload and RSA-signs key/iv/hash/seq),
+    responses are base64(json), and the session token is sent as the `tpweb_token`
+    cookie. Holds ONE admin session and reuses it — re-login evicts the family's
+    app/browser, so callers must avoid re-login storms."""
+
+    AUTH = "/cgi-bin/auth_cgi"
+    WEB = "/cgi-bin/web_cgi"
+
+    # action ids for the authenticator module (load/login/getAttempt/logout/update)
+    A_LOAD, A_LOGIN, A_LOGOUT = 0, 1, 3
+    # modules to try for the connected-client list (NOT "wlan" — that returns the
+    # WiFi config incl. the WiFi key). The M7200 serves clients under connectedDevices.
+    DEVICE_MODULES = ("connectedDevices", "clientList", "deviceList", "client")
+
+    def __init__(self, host, password, user="admin", timeout=12):
+        self.base = f"http://{host}" if host and "://" not in host else (host or "")
+        self.password = password or ""
+        self.user = user or "admin"
+        self.timeout = timeout
+        self._token = None        # session token (sent as the tpweb_token cookie)
+        self._dev_module = None   # learned module that returns the client list
+
+    # -- low-level HTTP ----------------------------------------------------- #
+    def _post(self, path, body, cookie=None):
+        if not self.base:
+            raise RouterUnreachable("no router_host configured")
+        data = body if isinstance(body, (bytes, bytearray)) else body.encode()
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = cookie
+        req = urllib.request.Request(self.base + path, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise AuthRejected(f"http {e.code}")
+            raise RouterUnreachable(f"http {e.code}")
+        except Exception as e:  # noqa: BLE001  (timeout, refused, dns, reset, ...)
+            raise RouterUnreachable(str(e))
+
+    @staticmethod
+    def _b64json(obj):
+        return base64.b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode()
+
+    def _decode(self, text, key=None, iv=None):
+        """Decode an M7200 response body: plain JSON, base64(JSON), or
+        base64(AES(JSON)) (the optional GDPR-mode login response)."""
+        text = (text or "").strip()
+        try:
+            return json.loads(text)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return json.loads(base64.b64decode(text))
+        except Exception:  # noqa: BLE001
+            pass
+        if key and iv:
+            try:
+                return json.loads(aes_cbc_decrypt(base64.b64decode(text),
+                                                  key.encode(), iv.encode()))
+            except Exception:  # noqa: BLE001
+                pass
+        raise RouterUnreachable("undecodable response")
+
+    # -- auth --------------------------------------------------------------- #
+    def _load(self):
+        """action 0: fetch nonce + RSA pubkey/mod + seqNum. No credentials."""
+        body = json.dumps({"data": self._b64json(
+            {"module": "authenticator", "action": self.A_LOAD})})
+        r = self._decode(self._post(self.AUTH, body))
+        return (_first(r, "nonce"), _first(r, "rsaPubKey"), _first(r, "rsaMod"),
+                _num(_first(r, "seqNum")) or 0)
+
+    def login(self):
+        """Establish a session. Raises AuthRejected on bad creds / rejected login,
+        RouterUnreachable on transient failure. On success caches the token."""
+        nonce, ee, nn, seq = self._load()
+        if not (nonce and ee and nn):
+            raise RouterUnreachable("handshake params (nonce/rsa) missing")
+        key, iv = _rand_ascii(16), _rand_ascii(16)
+        digest = _md5hex(f"{self.password}:{nonce}")
+        inner = json.dumps({"module": "authenticator", "action": self.A_LOGIN,
+                            "digest": digest}, separators=(",", ":"))
+        data = base64.b64encode(aes_cbc_encrypt(inner.encode(), key.encode(), iv.encode())).decode()
+        h = _md5hex(self.user + self.password)
+        sign = rsa_encrypt_pkcs1v15_hex(
+            f"key={key}&iv={iv}&h={h}&s={int(seq) + len(data)}".encode(),
+            int(str(ee), 16), int(str(nn), 16))
+        r = self._decode(self._post(self.AUTH, json.dumps({"data": data, "sign": sign})),
+                         key=key, iv=iv)
+        result = _num(_first(r, "result", "errorcode"))
+        tok = _first(r, "token")
+        if result == 0 and tok:
+            self._token = tok
+            return True
+        raise AuthRejected(f"login result={result}")  # nonzero => bad creds / locked
+
+    def call(self, module, action):
+        """An authenticated web_cgi call: data is base64(JSON), token via cookie,
+        response is base64(JSON). Raises AuthRejected on an expired/rejected token."""
+        if not self._token:
+            raise AuthRejected("not logged in")
+        body = json.dumps({"data": self._b64json(
+            {"token": self._token, "module": module, "action": action})})
+        resp = self._decode(self._post(self.WEB, body))
+        if isinstance(resp, dict):
+            res = _num(_first(resp, "result", "errorcode"))
+            if res is not None and res < 0:   # -4 = not authenticated / token expired
+                self._token = None
+                raise AuthRejected(f"token rejected result={res}")
+        return resp
+
+    def get_status(self):
+        """Normalized WAN dict (fields are top-level on the M7200 status response)."""
+        resp = self.call("status", 0)
+        wan = resp.get("wan", resp) if isinstance(resp, dict) else {}
+        return {
+            "rx": _num(_first(wan, "rxBytes", "totalRx", "rx")),
+            "tx": _num(_first(wan, "txBytes", "totalTx", "tx")),
+            "total": _num(_first(wan, "totalStatistics", "totalBytes", "total")),
+            "today": _num(_first(wan, "dailyStatistics", "todayBytes", "daily")),
+            "rx_speed": _num(_first(wan, "rxSpeed", "downSpeed")) or 0,
+            "tx_speed": _num(_first(wan, "txSpeed", "upSpeed")) or 0,
+            "operator": _first(wan, "operatorName", "operator", "isp") or "",
+            "status": _first(wan, "connectStatus", "status") or "",
+        }
+
+    @staticmethod
+    def _extract_list(resp):
+        if isinstance(resp, list):
+            return resp
+        if isinstance(resp, dict):
+            # the M7200 nests the clients as STAs:{num, list:[...]}; also accept a
+            # flat list under these keys, or a {..., list:[...]} wrapper.
+            for k in ("STAs", "connectedDevices", "clientList", "deviceList", "hosts",
+                      "list", "stationList", "clients"):
+                v = resp.get(k)
+                if isinstance(v, list):
+                    return v
+                if isinstance(v, dict) and isinstance(v.get("list"), list):
+                    return v["list"]
+            for v in resp.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    return v
+        return []
+
+    def get_devices(self):
+        """Connected-client list. The module varies by firmware, so try a few and
+        remember the one that yields a list."""
+        mods = ([self._dev_module] if self._dev_module else []) + list(self.DEVICE_MODULES)
+        for mod in mods:
+            if not mod:
+                continue
+            try:
+                lst = self._extract_list(self.call(mod, 0))
+            except AuthRejected:
+                raise
+            except Exception:  # noqa: BLE001
+                continue
+            if lst:
+                self._dev_module = mod
+                return lst
+        return []
+
+    def logout(self):
+        if self._token:
+            try:
+                self._post(self.WEB, json.dumps({"data": self._b64json(
+                    {"token": self._token, "module": "authenticator",
+                     "action": self.A_LOGOUT})}))
+            except Exception:  # noqa: BLE001
+                pass
+            self._token = None
+
+
+# --------------------------------------------------------------------------- #
+# RouterCollector — polls a gateway router on its own thread; the daemon drains it.
+# Whole-network WAN total + connected-device presence. NO per-device bytes exist on
+# the M7200, so per-machine numbers come only from instrumented host agents, with an
+# honest "other/uninstrumented (combined)" residual.
+# --------------------------------------------------------------------------- #
+class RouterCollector(Collector):
+    def __init__(self, cfg, client=None):
+        self.cfg = cfg
+        self.label = cfg.get("router_iface_label", "WAN")
+        self.password = env_value("MARSAD_ROUTER_PASSWORD") or ""
+        self.client = client or M7200Client(cfg.get("router_host", ""), self.password,
+                                             user="admin")
+        self._lock = threading.Lock()
+        self._acc = [0.0, 0.0]
+        self._last = {}
+        self._presence = []
+        self._wan = {}
+        self._split_mode = "unknown"
+        self._state = "INIT"
+        self._auth_fails = 0
+        self._backoff_until = 0.0
+        self._net_backoff = 0.0
+        self._last_evicted = 0.0
+        self._alerted_lockout = False
+        self.available = None
+        self._stop = threading.Event()
+        self._thread = None
+        self._per_host = {}
+        self._per_host_ts = 0.0
+
+    # -- Collector interface ----------------------------------------------- #
+    def start(self):
+        if not self.cfg.get("router_host"):
+            log("router mode: no router_host configured — set it in config.json and "
+                "restart; not starting the poll loop")
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self.client.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def target_label(self):
+        return self.label
+
+    def sample(self):
+        with self._lock:
+            acc, self._acc = self._acc, [0.0, 0.0]
+        deltas = {self.label: (int(acc[0]), int(acc[1]))} if (acc[0] or acc[1]) else {}
+        return deltas, {}
+
+    def presence(self):
+        with self._lock:
+            return list(self._presence)
+
+    def retarget(self, cfg):
+        self.cfg = cfg  # poll cadence / agents read live in the worker
+
+    def extras(self):
+        # read-only: the worker thread refreshes _per_host (no blocking HTTP here,
+        # so the panel handler and daemon loop never stall on a slow agent)
+        with self._lock:
+            devices = list(self._presence)
+            wan = dict(self._wan)
+            per_host = dict(self._per_host)
+            state = self._state
+            avail = self.available
+            split = self._split_mode
+        names = self.cfg.get("device_names", {})
+        for d in devices:
+            mac = (d.get("mac") or "").upper()
+            if mac in names:
+                d["name"] = names[mac]
+        per_host_list = [{"host": h, "total": human(b)} for h, b in per_host.items()]
+        win_secs = self.cfg["summary_window_min"] * 60
+        wan_window = self._window_total(win_secs)
+        residual = wan_window - sum(per_host.values())
+        return {
+            "available": avail,
+            "state": state,
+            "split_mode": split,
+            "operator": wan.get("operator", ""),
+            "status": wan.get("status", ""),
+            "devices": [{"name": d.get("name", ""), "mac": d.get("mac", ""),
+                         "ip": d.get("ip", "")} for d in devices],
+            "per_host": per_host_list,
+            "residual": human(residual) if per_host and residual > 0 else None,
+        }
+
+    def _window_total(self, secs):  # filled by the daemon via a back-reference
+        return getattr(self, "_window_total_fn", lambda s: 0)(secs)
+
+    # -- worker ------------------------------------------------------------- #
+    def _poll_sec(self):
+        return max(10, int(self.cfg.get("router_poll_sec", 30)))
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as e:  # noqa: BLE001
+                log(f"router collector error: {e}")
+            self._stop.wait(self._poll_sec())
+
+    def _tick(self):
+        now = time.time()
+        if now < self._backoff_until:
+            return
+        if self._state != "ACTIVE":
+            if not self._try_login(now):
+                return
+        try:
+            self._ingest_wan(self.client.get_status())
+            try:
+                devs = self.client.get_devices()
+                with self._lock:
+                    self._presence = self._normalize_devices(devs)
+            except RouterUnreachable:
+                pass  # presence is best-effort; keep last good
+            self._refresh_agents()  # aggregate host agents on the worker thread
+            self.available = True
+            self._net_backoff = 0.0
+        except AuthRejected:
+            self.available = False
+            self._state = "NEED_AUTH"
+            self._last_evicted = now
+            log("router token rejected/evicted — will re-auth after cooldown")
+        except RouterUnreachable as e:
+            self.available = False
+            self._backoff_net(now, str(e))
+
+    def _try_login(self, now):
+        if self._state == "NEED_AUTH" and (now - self._last_evicted) < self.cfg["router_reauth_cooldown_sec"]:
+            return False  # be a polite citizen of the single admin slot
+        try:
+            self.client.login()
+        except AuthRejected:
+            self._auth_fails += 1
+            self._state = "NEED_AUTH"
+            # Space even the pre-lockout attempts (never hammer the login endpoint
+            # with a bad credential): wait the reauth cooldown before retrying.
+            self._backoff_until = now + self.cfg["router_reauth_cooldown_sec"]
+            if self._auth_fails >= self.cfg["router_auth_fail_limit"]:
+                self._state = "LOCKED_OUT"
+                self._backoff_until = now + self.cfg["router_lockout_backoff_min"] * 60
+                if not self._alerted_lockout:
+                    self._alerted_lockout = True
+                    post_slack(
+                        f":warning: *{HOST} marsad* — router login REJECTED. Pausing re-auth "
+                        f"for {self.cfg['router_lockout_backoff_min']}m to avoid locking the "
+                        f"router out. Check MARSAD_ROUTER_PASSWORD / router_host.",
+                        self.cfg.get("slack_channel") or None)
+                log(f"router credential rejected x{self._auth_fails} -> LOCKED_OUT")
+            return False
+        except RouterUnreachable as e:
+            self._backoff_net(now, str(e))
+            return False
+        self._state = "ACTIVE"
+        self._auth_fails = 0
+        self._alerted_lockout = False
+        log("router login ok")
+        return True
+
+    def _backoff_net(self, now, why):
+        self._net_backoff = min(self.cfg["router_net_backoff_max_sec"],
+                                max(self._poll_sec(), self._net_backoff * 2 or self._poll_sec()))
+        self._backoff_until = now + self._net_backoff
+        log(f"router unreachable ({why}); backing off {int(self._net_backoff)}s")
+
+    def _ingest_wan(self, wan):
+        with self._lock:
+            self._wan = wan
+        rx, tx, total = wan.get("rx"), wan.get("tx"), wan.get("total")
+        if rx is not None and tx is not None:
+            drx, dtx = self._delta("rx", rx), self._delta("tx", tx)
+            self._split_mode = "real"
+        elif total is not None:
+            d = self._delta("total", total)
+            srx, stx = wan.get("rx_speed") or 0, wan.get("tx_speed") or 0
+            if srx + stx > 0:
+                drx = d * srx / (srx + stx)
+                dtx = d - drx
+                self._split_mode = "estimated"
+            else:
+                drx, dtx = d, 0
+                self._split_mode = "total_only"
+        else:
+            return  # nothing usable this poll
+        drx, dtx = max(0, drx), max(0, dtx)
+        cap_mb = self.cfg.get("router_max_delta_mb", 0)
+        if cap_mb:
+            cap = cap_mb * 1024 * 1024
+            tot = drx + dtx
+            if tot > cap and tot > 0:  # scale both directions, preserving the split
+                scale = cap / tot
+                drx, dtx = drx * scale, dtx * scale
+        with self._lock:
+            self._acc[0] += drx
+            self._acc[1] += dtx
+
+    def _delta(self, key, cur):
+        last = self._last.get(key)
+        self._last[key] = cur
+        if last is None:
+            return 0
+        return cur - last if cur >= last else cur  # monotonic reset clamp
+
+    def _normalize_devices(self, devs):
+        out = []
+        if not isinstance(devs, list):
+            return out
+        for d in devs[:256]:
+            if not isinstance(d, dict):
+                continue
+            mac = str(_first(d, "mac", "macAddr", "MACAddress", "MAC") or "").upper()
+            out.append({
+                "name": slack_escape(str(_first(d, "name", "hostName", "hostname",
+                                                "deviceName") or "")[:48]),
+                "mac": mac,
+                "ip": str(_first(d, "ip", "ipAddr", "IPAddress", "IP") or "")[:45],
+            })
+        return out
+
+    def _refresh_agents(self):
+        now = time.time()
+        if now - self._per_host_ts < 30:
+            return
+        self._per_host_ts = now
+        out = {}
+        for url in self.cfg.get("agent_endpoints", []):
+            try:
+                with urllib.request.urlopen(url.rstrip("/") + "/api/stats", timeout=5) as r:
+                    s = json.loads(r.read())
+                wb = s.get("window_bytes")
+                if wb is None:
+                    continue
+                out[str(s.get("host", url))] = int(wb)
+            except Exception:  # noqa: BLE001
+                continue
+        with self._lock:
+            self._per_host = out
+
+
+# --------------------------------------------------------------------------- #
+# Daemon
+# --------------------------------------------------------------------------- #
+class Daemon:
+    def __init__(self):
+        if not os.path.isdir(STATE_DIR):
+            os.makedirs(STATE_DIR, exist_ok=True)
+        self.cfg = load_config()
+        self.store = Store(DB_PATH)
+        self.collector = make_collector(self.cfg)
+        if isinstance(self.collector, RouterCollector):
+            # let the collector compute the WAN window total for the residual figure
+            self.collector._window_total_fn = lambda secs: sum(
+                self.store.iface_totals(int(time.time()) - secs).get(self.uplink, (0, 0)))
+        self.collector.start()
+        log(f"host={HOST} mode={self.cfg['mode']} target={self.collector.target_label()}")
+        self._last_report = self.store.get_meta("last_report", 0.0)
+        self._last_cap_alert = self.store.get_meta("last_cap_alert", 0.0)
+        # defer the first prune ~1h: nothing to prune on a fresh/just-loaded DB, and
+        # a checkpoint(TRUNCATE) right after the first write trips SQLITE_LOCKED.
+        self._last_prune = time.time()
+        self._stop = threading.Event()
+        dest = self.cfg.get("slack_channel") or env_value("MARSAD_SLACK_CHANNEL")
+        if not env_value("MARSAD_SLACK_TOKEN") or not dest:
+            log("WARNING slack token/channel not configured — digests + cap alerts will NOT send")
+        else:
+            log(f"slack destination: {dest}")
+
+    @property
+    def uplink(self):
+        return self.collector.target_label()
+
+    def sample(self):
+        ts = int(time.time())
+        deltas, attribution = self.collector.sample()
+        self.store.add_sample(ts, deltas, attribution)
+        return ts
+
+    def maybe_retarget(self):
+        self.collector.retarget(self.cfg)
 
     def check_cap(self):
         cap = self.cfg["cap_gb"]
@@ -624,12 +1652,18 @@ class Daemon:
             return
         if time.time() - self._last_cap_alert < self.cfg["cap_cooldown_min"] * 60:
             return
-        talkers = self.store.top_talkers(since, limit=3)
-        _, wtot = self.store.attribution(since)
-        wtot = wtot or 1.0
-        who = ", ".join(
-            f"{slack_escape(pretty_label(l, self.cfg['resolve_names']))} {(ws+wr)/wtot*100:.0f}%"
-            for l, ws, wr in talkers) or "unknown"
+        if self.cfg["mode"] in ("router", "network"):
+            devs = self.collector.presence()
+            who = (f"{len(devs)} devices online: " + ", ".join(
+                slack_escape(d.get("name") or d.get("mac") or d.get("ip") or "?")
+                for d in devs[:6])) if devs else "device list unavailable"
+        else:
+            talkers = self.store.top_talkers(since, limit=3)
+            _, wtot = self.store.attribution(since)
+            wtot = wtot or 1.0
+            who = ", ".join(
+                f"{slack_escape(pretty_label(l, self.cfg['resolve_names']))} {(ws+wr)/wtot*100:.0f}%"
+                for l, ws, wr in talkers) or "unknown"
         ok = post_slack(
             f":rotating_light: *{HOST} BANDWIDTH CAP HIT* — "
             f"{total_gb:.2f} GB on {self.uplink} in the last {win} min (cap {cap} GB).\n"
@@ -651,7 +1685,9 @@ class Daemon:
             return
         if time.time() - self._last_report < interval:
             return
-        msg = build_digest(self.store, self.cfg, self.uplink, self.cfg["summary_window_min"])
+        extras = self.collector.extras() if self.cfg["mode"] in ("router", "network") else None
+        msg = build_digest(self.store, self.cfg, self.uplink,
+                           self.cfg["summary_window_min"], extras)
         post_slack(msg, self.cfg.get("slack_channel") or None)
         self._last_report = time.time()
         self.store.set_meta("last_report", self._last_report)
@@ -678,7 +1714,7 @@ class Daemon:
 
     def stop(self):
         self._stop.set()
-        self.nethogs.stop()
+        self.collector.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -701,10 +1737,29 @@ table{width:100%;border-collapse:collapse} td{padding:3px 0} .r{text-align:right
   <div class=big id=live>…</div>
   <div id=window class=muted></div>
   <div id=day class=muted></div>
+  <div id=proj class=muted></div>
 </div>
 <div class=card>
+  <b>Rate graph</b> <span class=muted>(⬇ download blue · ⬆ upload red · last <span id=gwin></span> min)</span>
+  <div><img id=graph alt="traffic rate graph" style="width:100%;max-width:620px;height:auto"></div>
+</div>
+<div class=card id=talkerscard>
   <b>Top talkers</b> <span class=muted>(this window, est. share of WAN; <span id=attr></span>)</span>
   <table id=talkers></table>
+</div>
+<div class=card id=devicescard style=display:none>
+  <b>Connected devices</b> <span class=muted>(<span id=devcount></span> online · presence only — the router reports no per-device bytes)</span>
+  <table id=devices></table>
+</div>
+<div class=card id=hostscard style=display:none>
+  <b>Per-host usage</b> <span class=muted>(this window; instrumented hosts + combined "other")</span>
+  <table id=hosts></table>
+</div>
+<div class=card id=stopcard style=display:none>
+  <b>Danger zone</b>
+  <div class=muted>Kill the current top <span id=stopn></span> local consumers (SIGTERM, then SIGKILL after the grace). Protected processes are never touched.</div>
+  <button id=stopbtn style=background:#dc2626>⛔ Stop top consumers</button>
+  <span id=stopmsg class=muted></span>
 </div>
 <div class=card>
   <b>Settings</b>
@@ -721,6 +1776,14 @@ table{width:100%;border-collapse:collapse} td{padding:3px 0} .r{text-align:right
     <input name=cap_cooldown_min type=number min=1 max=1440>
     <label>Resolve endpoint IPs to hostnames (1 = on, 0 = off)</label>
     <input name=resolve_names type=number min=0 max=1>
+    <label>Projection window (min) — rate basis for the projected next-1h figure</label>
+    <input name=projection_window_min type=number min=1 max=60>
+    <label>Graph window (min) — time span shown in the rate graph</label>
+    <input name=graph_window_min type=number min=5 max=1440>
+    <label>Stop-top: number of consumers to kill (host mode)</label>
+    <input name=stop_top_n type=number min=1 max=20>
+    <label>Stop-top: SIGTERM→SIGKILL grace (sec)</label>
+    <input name=stop_grace_sec type=number min=1 max=60>
     <label>Admin token (only needed if the panel requires one)</label>
     <input id=token type=password style=width:200px>
     <button type=submit>Save</button>
@@ -736,8 +1799,17 @@ async function refresh(){
   setText('live', '⬇ '+s.live.rx_rate+'  ⬆ '+s.live.tx_rate+'  Σ '+s.live.total_rate);
   setText('window', 'last '+s.cfg.summary_window_min+' min:  ⬇ '+s.window.rx+' down  ⬆ '+s.window.tx+' up  Σ '+s.window.total+' total');
   setText('day', 'today:  ⬇ '+s.day.rx+' down  ⬆ '+s.day.tx+' up  Σ '+s.day.total+' total');
+  if(s.projection) setText('proj', 'projected next 1h:  Σ '+s.projection.total+'   (⬇ '+s.projection.rx+'  ⬆ '+s.projection.tx+')');
   setText('attr', s.attributed_pct+'% attributed to a process');
   setText('ago', new Date().toLocaleTimeString());
+  let gw = s.cfg.graph_window_min||120; setText('gwin', gw);
+  document.getElementById('graph').src = '/graph.svg?mins='+gw+'&_='+Date.now();
+  let host = s.mode==='host';
+  document.getElementById('stopcard').style.display = host ? '' : 'none';
+  document.getElementById('talkerscard').style.display = host ? '' : 'none';
+  document.getElementById('devicescard').style.display = host ? 'none' : '';
+  document.getElementById('hostscard').style.display = host ? 'none' : '';
+  setText('stopn', s.cfg.stop_top_n);
   let tb = document.getElementById('talkers');
   tb.replaceChildren();
   if(!s.talkers.length){
@@ -748,8 +1820,26 @@ async function refresh(){
     let c1 = tr.insertCell(); c1.className='r'; c1.textContent = x.bytes;
     let c2 = tr.insertCell(); c2.className='r'; c2.textContent = x.pct+'%';
   }
+  if(s.router) renderRouter(s.router);
   for(const k in s.cfg){ let el=document.querySelector('[name='+k+']'); if(el&&el!==document.activeElement) el.value=s.cfg[k]; }
 }
+function renderRouter(r){
+  setText('devcount', (r.devices||[]).length);
+  let db = document.getElementById('devices'); db.replaceChildren();
+  if(!(r.devices||[]).length){ let td=db.insertRow().insertCell(); td.className='muted'; td.textContent=r.available===false?'router unreachable':'no devices'; }
+  else for(const d of r.devices){ let tr=db.insertRow(); tr.insertCell().textContent=d.name||d.mac||d.ip||'?'; let c=tr.insertCell(); c.className='muted'; c.textContent=(d.ip||'')+(d.mac?'  '+d.mac:''); }
+  let hb = document.getElementById('hosts'); hb.replaceChildren();
+  for(const h of (r.per_host||[])){ let tr=hb.insertRow(); tr.insertCell().textContent=h.host; let c=tr.insertCell(); c.className='r'; c.textContent=h.total; }
+  if(r.residual){ let tr=hb.insertRow(); tr.insertCell().textContent='other / uninstrumented (combined)'; let c=tr.insertCell(); c.className='r'; c.textContent=r.residual; }
+}
+document.getElementById('stopbtn').onclick = async ()=>{
+  if(!confirm('Kill the current top local consumers? Sends SIGTERM, then SIGKILL after the grace.')) return;
+  let t = document.getElementById('token').value;
+  let r = await (await fetch('/stop-top',{method:'POST',headers:{'Content-Type':'application/json','X-Marsad-Token':t},body:JSON.stringify({confirm:true})})).json();
+  if(r.ok){ let k=(r.killed||[]).map(x=>x.name+'('+x.pid+'→'+x.signal+')').join(', ')||'nothing'; setText('stopmsg','✓ '+k+((r.skipped||[]).length?' · skipped '+r.skipped.length+' protected':'')); }
+  else setText('stopmsg','✗ '+(r.error||'error'));
+  setTimeout(()=>setText('stopmsg',''),6000);
+};
 document.getElementById('f').onsubmit = async e =>{
   e.preventDefault();
   let t = document.getElementById('token').value;
@@ -788,22 +1878,60 @@ def make_handler(daemon):
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif self.path.startswith("/api/stats"):
                 self._send(200, json.dumps(self._stats()))
+            elif self.path.startswith("/graph.svg"):
+                self._send(200, self._graph(), "image/svg+xml; charset=utf-8")
             else:
                 self._send(404, json.dumps({"error": "not found"}))
 
-        def do_POST(self):
-            if self.path != "/config":
-                self._send(404, json.dumps({"error": "not found"}))
-                return
+        def _graph(self):
+            cfg = daemon.cfg
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            iface = params.get("iface", [""])[0] or (daemon.uplink or "")
+            if not IFACE_RE.fullmatch(iface or ""):
+                iface = daemon.uplink or ""
+            try:
+                mins = int(params.get("mins", [cfg["graph_window_min"]])[0])
+            except (ValueError, TypeError):
+                mins = cfg["graph_window_min"]
+            mins = min(max(mins, 5), 1440)
+            if not iface:
+                return render_svg([[0, 0]], 1)
+            bins, width = daemon.store.series(iface, int(time.time()) - mins * 60)
+            return render_svg(bins, width)
+
+        def _check_token(self):
             tok = env_value("MARSAD_PANEL_TOKEN")
             if tok and self.headers.get("X-Marsad-Token", "") != tok:
                 self._send(403, json.dumps({"ok": False, "error": "bad or missing admin token"}))
+                return None
+            return tok or ""
+
+        def _read_json(self):
+            n = int(self.headers.get("Content-Length", 0))
+            if n > 65536:
+                raise ValueError("payload too large")
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def do_POST(self):
+            if self.path == "/config":
+                self._do_config()
+            elif self.path == "/stop-top":
+                self._do_stop_top()
+            else:
+                self._send(404, json.dumps({"error": "not found"}))
+
+        def _do_config(self):
+            # Changing settings requires an admin token to be configured (matched).
+            # With no token the panel is view-only — never silently world-writable.
+            tok = self._check_token()
+            if tok is None:
+                return
+            if not tok:
+                self._send(403, json.dumps(
+                    {"ok": False, "error": "set MARSAD_PANEL_TOKEN to change settings"}))
                 return
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                if n > 65536:
-                    raise ValueError("payload too large")
-                data = json.loads(self.rfile.read(n) or b"{}")
+                data = self._read_json()
                 cfg = load_config()
                 for k in LIVE_KEYS:
                     if k in data and data[k] != "":
@@ -819,6 +1947,34 @@ def make_handler(daemon):
                 self._send(200, json.dumps({"ok": True}))
             except Exception as e:  # noqa: BLE001
                 self._send(400, json.dumps({"ok": False, "error": str(e)}))
+
+        def _do_stop_top(self):
+            # Destructive: always require an admin token to be configured (not just
+            # matched) so an unauthenticated panel can never kill processes.
+            tok = self._check_token()
+            if tok is None:
+                return
+            if not tok:
+                self._send(403, json.dumps(
+                    {"ok": False, "error": "stop-top requires MARSAD_PANEL_TOKEN to be set"}))
+                return
+            cfg = daemon.cfg
+            if cfg.get("mode") != "host":
+                self._send(400, json.dumps(
+                    {"ok": False, "error": "stop-top is only available in host mode"}))
+                return
+            try:
+                data = self._read_json()
+            except Exception as e:  # noqa: BLE001
+                self._send(400, json.dumps({"ok": False, "error": str(e)}))
+                return
+            if data.get("confirm") is not True:
+                self._send(400, json.dumps(
+                    {"ok": False, "error": 'confirmation required: {"confirm": true}'}))
+                return
+            res = stop_top_consumers(daemon.collector, cfg["stop_top_n"],
+                                     cfg["stop_grace_sec"], cfg.get("protected_procs", []))
+            self._send(200 if res.get("ok") else 400, json.dumps(res))
 
         def _stats(self):
             cfg = daemon.cfg
@@ -839,21 +1995,29 @@ def make_handler(daemon):
                     continue
                 tk.append({"label": pretty_label(label, cfg["resolve_names"]),
                            "bytes": human(frac * tot), "pct": f"{frac*100:.0f}"})
-            return {
+            pj = projection_1h(daemon.store, daemon.uplink, cfg["projection_window_min"])
+            out = {
                 "host": HOST,
+                "mode": cfg["mode"],
                 "uplink": up,
                 "live": {"rx_rate": human(lrx / span) + "/s",
                          "tx_rate": human(ltx / span) + "/s",
                          "total_rate": human((lrx + ltx) / span) + "/s"},
                 "window": {"rx": human(rx), "tx": human(tx), "total": human(rx + tx)},
+                "window_bytes": int(rx + tx),   # raw, for router-mode agent aggregation
                 "day": {"rx": human(day[0]), "tx": human(day[1]), "total": human(day[0] + day[1])},
+                "projection": {"rx": human(pj["rx"]), "tx": human(pj["tx"]), "total": human(pj["total"])},
                 "attributed_pct": f"{(attr_w / tot_w * 100) if tot_w else 0:.0f}",
                 "talkers": tk,
                 "cfg": {k: cfg[k] for k in (
                     "report_interval_min", "summary_window_min", "cap_gb",
                     "sample_interval_sec", "cap_cooldown_min", "slack_channel",
-                    "resolve_names")},
+                    "resolve_names", "projection_window_min", "graph_window_min",
+                    "stop_top_n", "stop_grace_sec")},
             }
+            if cfg["mode"] in ("router", "network"):
+                out["router"] = daemon.collector.extras()  # presence / per-host / residual
+            return out
 
     return H
 
@@ -877,8 +2041,9 @@ def serve_panel(daemon):
     else:
         bind = host
     if bind == "0.0.0.0" and not env_value("MARSAD_PANEL_TOKEN"):
-        log("WARNING: panel bound to 0.0.0.0 with NO admin token — "
-            "anyone who can reach this host can change settings (set MARSAD_PANEL_TOKEN)")
+        log("WARNING: panel bound to 0.0.0.0 with NO admin token — usage is viewable "
+            "by anyone who can reach this host (settings are read-only without a token; "
+            "set MARSAD_PANEL_TOKEN to enable + protect changes)")
     httpd = http.server.ThreadingHTTPServer((bind, port), make_handler(daemon))
     httpd.daemon_threads = True
     log(f"admin panel on http://{bind}:{port}")
