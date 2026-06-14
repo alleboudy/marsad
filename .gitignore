@@ -4,4 +4,6 @@ __pycache__/
 *.db-wal
 *.db-shm
 config.json
-marsad.env
+# secrets — every per-instance env (host.env, network.env, marsad.env). The
+# committed example is marsad.env.example, which is NOT matched by *.env.
+*.env

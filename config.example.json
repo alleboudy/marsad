@@ -1,4 +1,5 @@
 {
+  "mode": "host",
   "report_interval_min": 60,
   "summary_window_min": 60,
   "cap_gb": 5.0,
@@ -10,5 +11,20 @@
   "panel_port": 8092,
   "retention_days": 8,
   "slack_channel": "",
-  "resolve_names": 1
+  "resolve_names": 1,
+  "projection_window_min": 5,
+  "graph_window_min": 120,
+  "stop_top_n": 3,
+  "stop_grace_sec": 8,
+  "protected_procs": [],
+  "router_host": "",
+  "router_iface_label": "WAN",
+  "router_poll_sec": 30,
+  "router_auth_fail_limit": 2,
+  "router_lockout_backoff_min": 240,
+  "router_net_backoff_max_sec": 600,
+  "router_reauth_cooldown_sec": 120,
+  "router_max_delta_mb": 0,
+  "agent_endpoints": [],
+  "device_names": {}
 }

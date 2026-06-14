@@ -1,0 +1,46 @@
+[Unit]
+# Templated unit: run one instance per mode, e.g. `marsad@host` and `marsad@network`.
+# Each instance gets its own state dir (/var/lib/marsad-%i), env file
+# (/etc/marsad/%i.env), config.json and panel port — so a host NIC monitor and a
+# router/network monitor coexist on one box from one codebase.
+Description=marsad (%i) — bandwidth observatory
+After=network-online.target docker.service
+Wants=network-online.target
+# Let a genuine crash-loop reach a terminal 'failed' state (5 crashes / 5 min).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/marsad/marsad.py
+EnvironmentFile=-/etc/marsad/%i.env
+Environment=MARSAD_ENV=/etc/marsad/%i.env
+Restart=on-failure
+RestartSec=5
+
+# systemd provisions /var/lib/marsad-%i (writable under ProtectSystem=strict) before
+# ExecStart and exports $STATE_DIRECTORY, which the daemon reads for its DB/config.
+StateDirectory=marsad-%i
+StateDirectoryMode=0750
+UMask=0077
+
+# DEFAULT (host mode): per-process attribution (nethogs/pcap) needs raw sockets +
+# reading other users' /proc/<pid>; CAP_KILL backs the "stop top consumers" action.
+# The marsad@network instance drops ALL of these via a drop-in override (router mode
+# only makes outbound HTTP) — see install.sh / marsad@network.override.conf.
+User=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_KILL
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_KILL
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
