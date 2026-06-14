@@ -451,9 +451,12 @@ class Store:
     def __init__(self, path):
         self.lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA busy_timeout=5000")  # wait on lock contention vs erroring
-        self.db.execute("PRAGMA wal_autocheckpoint=200")
+        # fetchall() consumes each PRAGMA's result row so the statement is finalized;
+        # an unconsumed PRAGMA cursor leaves a read lock that makes the first write
+        # fail with SQLITE_LOCKED ("database table is locked") on some platforms.
+        self.db.execute("PRAGMA journal_mode=WAL").fetchall()
+        self.db.execute("PRAGMA busy_timeout=5000").fetchall()  # wait on lock contention
+        self.db.execute("PRAGMA wal_autocheckpoint=200").fetchall()
         self.db.execute("CREATE TABLE IF NOT EXISTS iface (ts INTEGER, iface TEXT, rx INTEGER, tx INTEGER)")
         self.db.execute("CREATE TABLE IF NOT EXISTS proc (ts INTEGER, label TEXT, w_sent REAL, w_recv REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v REAL)")
