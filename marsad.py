@@ -1185,8 +1185,9 @@ class M7200Client:
 
     # action ids for the authenticator module (load/login/getAttempt/logout/update)
     A_LOAD, A_LOGIN, A_LOGOUT = 0, 1, 3
-    # modules to try for the connected-client list (firmware varies)
-    DEVICE_MODULES = ("wlan", "connectedDevices", "clientList", "deviceList", "client")
+    # modules to try for the connected-client list (NOT "wlan" — that returns the
+    # WiFi config incl. the WiFi key). The M7200 serves clients under connectedDevices.
+    DEVICE_MODULES = ("connectedDevices", "clientList", "deviceList", "client")
 
     def __init__(self, host, password, user="admin", timeout=12):
         self.base = f"http://{host}" if host and "://" not in host else (host or "")
@@ -1277,8 +1278,9 @@ class M7200Client:
         response is base64(JSON). Raises AuthRejected on an expired/rejected token."""
         if not self._token:
             raise AuthRejected("not logged in")
-        body = json.dumps({"data": self._b64json({"module": module, "action": action})})
-        resp = self._decode(self._post(self.WEB, body, cookie=f"tpweb_token={self._token}"))
+        body = json.dumps({"data": self._b64json(
+            {"token": self._token, "module": module, "action": action})})
+        resp = self._decode(self._post(self.WEB, body))
         if isinstance(resp, dict):
             res = _num(_first(resp, "result", "errorcode"))
             if res is not None and res < 0:   # -4 = not authenticated / token expired
@@ -1306,10 +1308,15 @@ class M7200Client:
         if isinstance(resp, list):
             return resp
         if isinstance(resp, dict):
-            for k in ("connectedDevices", "clientList", "deviceList", "hosts",
+            # the M7200 nests the clients as STAs:{num, list:[...]}; also accept a
+            # flat list under these keys, or a {..., list:[...]} wrapper.
+            for k in ("STAs", "connectedDevices", "clientList", "deviceList", "hosts",
                       "list", "stationList", "clients"):
-                if isinstance(resp.get(k), list):
-                    return resp[k]
+                v = resp.get(k)
+                if isinstance(v, list):
+                    return v
+                if isinstance(v, dict) and isinstance(v.get("list"), list):
+                    return v["list"]
             for v in resp.values():
                 if isinstance(v, list) and v and isinstance(v[0], dict):
                     return v
@@ -1337,8 +1344,8 @@ class M7200Client:
         if self._token:
             try:
                 self._post(self.WEB, json.dumps({"data": self._b64json(
-                    {"module": "authenticator", "action": self.A_LOGOUT})}),
-                    cookie=f"tpweb_token={self._token}")
+                    {"token": self._token, "module": "authenticator",
+                     "action": self.A_LOGOUT})}))
             except Exception:  # noqa: BLE001
                 pass
             self._token = None

@@ -200,15 +200,16 @@ def test_router_integration():
                 return self._send({"result": 0, "nonce": NONCE, "rsaPubKey": format(e, "x"),
                                    "rsaMod": modhex, "seqNum": SEQ})
             if self.path == cls.WEB:
-                if "tpweb_token=tok" not in self.headers.get("Cookie", ""):
+                inner = json.loads(b64.b64decode(req["data"]))
+                if inner.get("token") != "tok":   # token travels in the body, not a cookie
                     return self._send({"result": -4})
-                mod = json.loads(b64.b64decode(req["data"]))["module"]
+                mod = inner["module"]
                 if mod == "status":
-                    return self._send({"totalStatistics": state["total"], "rxSpeed": 300,
-                                       "txSpeed": 100, "operatorName": "MockNet", "connectStatus": "up"})
-                if mod in ("wlan", "connectedDevices"):
-                    return self._send({"clientList": [{"name": "P", "macAddr": "a1:b2:c3:d4:e5:f6",
-                                                       "ipAddr": "10.0.0.9"}]})
+                    return self._send({"wan": {"totalStatistics": state["total"], "rxSpeed": 300,
+                                       "txSpeed": 100, "operatorName": "MockNet", "connectStatus": 4}})
+                if mod == "connectedDevices":  # M7200 nests as STAs:{num,list:[...]}
+                    return self._send({"STAs": {"num": 1, "list": [
+                        {"name": "P", "mac": "a1:b2:c3:d4:e5:f6", "ip": "10.0.0.9"}]}})
                 return self._send({"result": 0})
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
