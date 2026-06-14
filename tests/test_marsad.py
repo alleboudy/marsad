@@ -86,6 +86,16 @@ def test_stop_top():
     time.sleep(0.3)
     check("fresh unrelated proc not protected", not m.is_protected(victim.pid))
     check("extra-token protects a proc", m.is_protected(guard.pid, extra=["sleep"]))
+    # comm is generic (python3) but the cmdline carries a protected token
+    tagged = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(300)", "ci-proxpi-marker"],
+                              start_new_session=True)
+    time.sleep(0.3)
+    check("cmdline token protects when comm is generic",
+          m.is_protected(tagged.pid, extra=["ci-proxpi"]) and not m.is_protected(tagged.pid))
+    try:
+        tagged.kill()
+    except Exception:
+        pass
     hc = m.HostCollector(dict(m.DEFAULTS))
     hc._pid_acc = {("/bin/sleep", victim.pid): [1e9, 1e9], ("/sbin/init", 1): [9e8, 9e8]}
     res = m.stop_top_consumers(hc, n=5, grace=2, extra=[])

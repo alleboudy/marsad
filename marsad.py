@@ -870,6 +870,14 @@ def proc_comm(pid):
         return ""
 
 
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -899,13 +907,16 @@ def is_protected(pid, extra=()):
     comm = proc_comm(pid)
     if not comm or comm in PROTECT_COMM:
         return True
-    low = comm.lower()
+    # token match is against comm + the FULL cmdline (lowercased), so allowlist
+    # entries catch processes whose comm is generic (python3/node) but whose
+    # cmdline identifies critical infra (CI runners, ci-* containers, the LLM stack).
+    hay = (comm + " " + proc_cmdline(pid)).lower()
     for tok in PROTECT_TOKENS:
-        if tok in low:
+        if tok in hay:
             return True
     for tok in extra:
         t = str(tok).strip().lower()
-        if t and t in low:
+        if t and t in hay:
             return True
     return False
 
