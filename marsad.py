@@ -1602,7 +1602,9 @@ class Daemon:
         log(f"host={HOST} mode={self.cfg['mode']} target={self.collector.target_label()}")
         self._last_report = self.store.get_meta("last_report", 0.0)
         self._last_cap_alert = self.store.get_meta("last_cap_alert", 0.0)
-        self._last_prune = 0.0
+        # defer the first prune ~1h: nothing to prune on a fresh/just-loaded DB, and
+        # a checkpoint(TRUNCATE) right after the first write trips SQLITE_LOCKED.
+        self._last_prune = time.time()
         self._stop = threading.Event()
         dest = self.cfg.get("slack_channel") or env_value("MARSAD_SLACK_CHANNEL")
         if not env_value("MARSAD_SLACK_TOKEN") or not dest:
