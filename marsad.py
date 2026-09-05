@@ -2187,9 +2187,13 @@ def make_handler(daemon):
             up = daemon.uplink or "(resolving)"
             since = int(time.time()) - cfg["summary_window_min"] * 60
             iface = daemon.store.iface_totals(since)
-            rx, tx = iface.get(daemon.uplink, (0, 0))
-            day = daemon.store.iface_totals(midnight_epoch()).get(daemon.uplink, (0, 0))
-            lrx, ltx = daemon.store.last_iface(daemon.uplink) if daemon.uplink else (0, 0)
+            if cfg["mode"] in ("router", "network"):
+                meter, meter_note = daemon.uplink, "router WAN"
+            else:
+                meter, meter_note = wan_meter(iface, daemon.uplink)
+            rx, tx = iface.get(meter, (0, 0))
+            day = daemon.store.iface_totals(midnight_epoch()).get(meter, (0, 0))
+            lrx, ltx = daemon.store.last_iface(meter) if meter else (0, 0)
             span = cfg["sample_interval_sec"] or 60
             talkers = daemon.store.top_talkers(since, limit=10)
             attr_w, tot_w = daemon.store.attribution(since)
@@ -2201,11 +2205,12 @@ def make_handler(daemon):
                     continue
                 tk.append({"label": pretty_label(label, cfg["resolve_names"]),
                            "bytes": human(frac * tot), "pct": f"{frac*100:.0f}"})
-            pj = projection_1h(daemon.store, daemon.uplink, cfg["projection_window_min"])
+            pj = projection_1h(daemon.store, meter, cfg["projection_window_min"])
             out = {
                 "host": HOST,
                 "mode": cfg["mode"],
                 "uplink": up,
+                "meter": meter_note,
                 "live": {"rx_rate": human(lrx / span) + "/s",
                          "tx_rate": human(ltx / span) + "/s",
                          "total_rate": human((lrx + ltx) / span) + "/s"},
