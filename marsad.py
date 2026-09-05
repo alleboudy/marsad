@@ -56,7 +56,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-HOST = socket.gethostname()
+# MARSAD_LABEL overrides the hostname in Slack lines (e.g. a box whose
+# hostname is a username). Falls back to the plain hostname.
+HOST = os.environ.get("MARSAD_LABEL") or socket.gethostname()
 STATE_DIR = os.environ.get("STATE_DIRECTORY", "/var/lib/marsad").split(":")[0]
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 DB_PATH = os.path.join(STATE_DIR, "marsad.db")
@@ -95,6 +97,23 @@ DEFAULTS = {
 }
 
 INTRAHOST_PREFIXES = ("lo", "docker", "br-", "veth", "tailscale")
+
+# --- WAN pseudo-interfaces -------------------------------------------------
+# On a box whose uplink NIC also carries LAN, the NIC counter over-reports:
+# every LAN byte lands on the metered number. When the `inet bwmon` nftables
+# counter table is loaded (see wan-counters.nft — address-based, so it
+# survives an uplink move), host mode stores three pseudo-interfaces beside
+# the real NICs and bills the cap + digest against "wan" instead of the NIC.
+WAN_IFACE = "wan"            # host + containers, LAN/tailnet excluded
+WAN_HOST_IFACE = "wan-host"  # host-originated WAN bytes (nethogs can see these)
+WAN_CTR_IFACE = "wan-ctr"    # NAT-forwarded container WAN bytes (nethogs cannot)
+PSEUDO_IFACES = (WAN_IFACE, WAN_HOST_IFACE, WAN_CTR_IFACE)
+NFT_BIN = "nft"
+NFT_TABLE = ("inet", "bwmon")
+_NFT_COUNTER_MAP = {
+    "host_in": (WAN_HOST_IFACE, 0), "host_out": (WAN_HOST_IFACE, 1),
+    "ctr_in": (WAN_CTR_IFACE, 0), "ctr_out": (WAN_CTR_IFACE, 1),
+}
 LIVE_KEYS = ("report_interval_min", "summary_window_min", "cap_gb",
              "cap_cooldown_min", "sample_interval_sec", "resolve_names",
              "projection_window_min", "graph_window_min", "stop_top_n", "stop_grace_sec",
@@ -262,6 +281,94 @@ def read_proc_net_dev():
 
 def is_intrahost(iface):
     return any(iface.startswith(p) for p in INTRAHOST_PREFIXES)
+
+
+_nft_last_complaint = [None]
+
+
+def _nft_complain(msg=None):
+    """Log a WAN-meter degradation once per distinct reason, and log recovery.
+
+    Silence is deliberately not an option: falling back to the NIC meter means
+    LAN traffic starts counting as metered WAN again, which is the exact bug
+    the counters exist to fix, so the fallback has to be visible in the log."""
+    if msg is None:
+        if _nft_last_complaint[0] is not None:
+            log("nft WAN counters readable again — back on the LAN-excluded meter")
+            _nft_last_complaint[0] = None
+        return
+    if msg != _nft_last_complaint[0]:
+        log(f"WAN METER DEGRADED — {msg}; falling back to the uplink NIC "
+            "counter, which counts LAN traffic as metered WAN")
+        _nft_last_complaint[0] = msg
+
+
+def read_nft_wan():
+    """Return {pseudo_iface: (rx, tx)} from the `inet bwmon` nft counters —
+    cumulative since the rules were loaded — or {} when they are not loaded."""
+    cmd = [NFT_BIN, "-j", "list", "counters", "table", *NFT_TABLE]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception as e:  # noqa: BLE001 - never let the meter kill the loop
+        _nft_complain(f"nft invocation failed: {e}")
+        return {}
+    if proc.returncode != 0:
+        _nft_complain(f"nft rc={proc.returncode}: {proc.stderr.strip()[:200] or '(no stderr)'}")
+        return {}
+    try:
+        parsed = json.loads(proc.stdout)
+    except (ValueError, TypeError) as e:
+        _nft_complain(f"nft -j output unparseable: {e}")
+        return {}
+    acc = {WAN_HOST_IFACE: [0, 0], WAN_CTR_IFACE: [0, 0]}
+    seen = 0
+    for entry in parsed.get("nftables", []):
+        ctr = entry.get("counter")
+        if not isinstance(ctr, dict):
+            continue
+        target = _NFT_COUNTER_MAP.get(ctr.get("name", ""))
+        if target is None:
+            continue
+        iface, direction = target
+        acc[iface][direction] += int(ctr.get("bytes", 0))
+        seen += 1
+    if seen < len(_NFT_COUNTER_MAP):
+        _nft_complain(f"nft table present but only {seen}/{len(_NFT_COUNTER_MAP)} "
+                      "expected counters found")
+        return {}
+    _nft_complain(None)
+    out = {k: (v[0], v[1]) for k, v in acc.items()}
+    out[WAN_IFACE] = (out[WAN_HOST_IFACE][0] + out[WAN_CTR_IFACE][0],
+                      out[WAN_HOST_IFACE][1] + out[WAN_CTR_IFACE][1])
+    return out
+
+
+def nft_deltas(prev, cur):
+    """Per-cycle deltas for the pseudo-interfaces, reset-tolerant.
+
+    A ruleset reload zeroes the cumulative counters; a negative delta means
+    exactly that, so the current value IS the delta. Zero rows are returned on
+    purpose: the wan series must exist in every window it was measurable in,
+    or a quiet hour would silently flip the cap back onto the NIC meter."""
+    out = {}
+    for iface, (rx, tx) in cur.items():
+        prx, ptx = prev.get(iface, (None, None))
+        drx = 0 if prx is None else (rx if rx - prx < 0 else rx - prx)
+        dtx = 0 if ptx is None else (tx if tx - ptx < 0 else tx - ptx)
+        out[iface] = (drx, dtx)
+    return out
+
+
+def wan_meter(iface_totals, uplink):
+    """Pick which meter to bill against, and a label saying which it is.
+
+    Prefers the nft counters; the NIC is a fallback, not an equal option — it
+    over-reports by however much LAN crossed the shared interface. The label
+    is surfaced in Slack so a reader can always tell which meter produced a
+    number."""
+    if WAN_IFACE in iface_totals:
+        return WAN_IFACE, "nft WAN counters · LAN excluded"
+    return uplink, f"{uplink} NIC · LAN INCLUDED"
 
 
 # --------------------------------------------------------------------------- #
@@ -623,7 +730,8 @@ def midnight_epoch():
 
 def _host_digest_block(lines, store, cfg, uplink, iface, since, up_rx, up_tx):
     others = [(i, v) for i, v in iface.items()
-              if i != uplink and not is_intrahost(i) and (v[0] + v[1]) > 1024 * 1024]
+              if i != uplink and i not in PSEUDO_IFACES and not is_intrahost(i)
+              and (v[0] + v[1]) > 1024 * 1024]
     if others:
         others.sort(key=lambda x: -(x[1][0] + x[1][1]))
         seg = "  ·  ".join(f"{slack_escape(i)}: {human(v[0] + v[1])}" for i, v in others[:5])
@@ -687,19 +795,25 @@ def _router_digest_block(lines, cfg, extras):
 def build_digest(store, cfg, uplink, window_min, extras=None):
     since = int(time.time()) - window_min * 60
     iface = store.iface_totals(since)
-    up_rx, up_tx = iface.get(uplink, (0, 0))
     router = cfg["mode"] in ("router", "network")
-    scope = "M7200, whole network" if router else uplink
+    if router:
+        meter, scope = uplink, "M7200, whole network"
+    else:
+        meter, scope = wan_meter(iface, uplink)
+    up_rx, up_tx = iface.get(meter, (0, 0))
 
     lines = [f"*{HOST} bandwidth* — last {window_min} min"]
     lines.append(f"WAN ({scope}):  ⬇ {human(up_rx)} down   ⬆ {human(up_tx)} up   "
                  f"Σ {human(up_rx + up_tx)} total")
+    if not router and meter == WAN_IFACE and uplink in iface:
+        n = iface[uplink]
+        lines.append(f"uplink NIC {slack_escape(uplink)} incl. LAN:  Σ {human(n[0] + n[1])}")
 
-    day = store.iface_totals(midnight_epoch()).get(uplink, (0, 0))
+    day = store.iface_totals(midnight_epoch()).get(meter, (0, 0))
     lines.append(f"today so far:  ⬇ {human(day[0])} down   ⬆ {human(day[1])} up   "
                  f"Σ {human(day[0] + day[1])} total")
 
-    pj = projection_1h(store, uplink, cfg["projection_window_min"])
+    pj = projection_1h(store, meter, cfg["projection_window_min"])
     lines.append(f"projected next 1h (at last {cfg['projection_window_min']}m rate):  "
                  f"Σ {human(pj['total'])}")
 
@@ -761,6 +875,7 @@ class HostCollector(Collector):
         self.labeler = Labeler()
         self.nethogs = NethogsReader(self.uplink or "lo", cfg["nethogs_delay_sec"])
         self._last_counters = read_proc_net_dev()
+        self._last_nft = read_nft_wan()
         self._started = False
         self._pid_acc = {}      # (path, pid:int) -> [w_sent, w_recv], decayed each cycle
 
@@ -798,6 +913,12 @@ class HostCollector(Collector):
             if drx or dtx:
                 deltas[iface] = (drx, dtx)
         self._last_counters = cur
+
+        cur_nft = read_nft_wan()
+        if cur_nft:
+            # Zero rows included on purpose — see nft_deltas.
+            deltas.update(nft_deltas(self._last_nft, cur_nft))
+            self._last_nft = cur_nft
 
         drained = self.nethogs.drain()
         proc_weights = {}
@@ -1696,7 +1817,12 @@ class Daemon:
             return
         win = self.cfg["summary_window_min"]
         since = int(time.time()) - win * 60
-        rx, tx = self.store.iface_totals(since).get(self.uplink, (0, 0))
+        totals = self.store.iface_totals(since)
+        if self.cfg["mode"] in ("router", "network"):
+            meter, meter_note = self.uplink, "router WAN"
+        else:
+            meter, meter_note = wan_meter(totals, self.uplink)
+        rx, tx = totals.get(meter, (0, 0))
         total_gb = (rx + tx) / (1024 ** 3)
         if total_gb < cap:
             return
@@ -1714,10 +1840,20 @@ class Daemon:
             who = ", ".join(
                 f"{slack_escape(pretty_label(l, self.cfg['resolve_names']))} {(ws+wr)/wtot*100:.0f}%"
                 for l, ws, wr in talkers) or "unknown"
+        # The host/container split comes from the nft counters and is complete;
+        # the talker list comes from nethogs and cannot see NAT-forwarded
+        # container traffic, so state its coverage.
+        detail = ""
+        if meter == WAN_IFACE:
+            h = totals.get(WAN_HOST_IFACE, (0, 0))
+            c = totals.get(WAN_CTR_IFACE, (0, 0))
+            detail = f"\nhost {human(h[0] + h[1])}  ·  containers {human(c[0] + c[1])}"
         ok = post_slack(
             f":rotating_light: *{HOST} BANDWIDTH CAP HIT* — "
-            f"{total_gb:.2f} GB on {self.uplink} in the last {win} min (cap {cap} GB).\n"
-            f"⬇ {human(rx)} down  ⬆ {human(tx)} up  Σ {human(rx + tx)} total.  top: {who}",
+            f"{total_gb:.2f} GB on {meter} in the last {win} min (cap {cap} GB) "
+            f"[meter: {meter_note}].\n"
+            f"⬇ {human(rx)} down  ⬆ {human(tx)} up  Σ {human(rx + tx)} total.{detail}"
+            f"\ntop: {who}",
             self.cfg.get("slack_channel") or None,
         )
         if ok:

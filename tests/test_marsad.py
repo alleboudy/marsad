@@ -291,6 +291,62 @@ def test_review_fixes():
         print("SKIP stop-top identity guard (needs Linux)")
 
 
+
+
+def test_wan_meter():
+    # Preference: the nft pseudo-iface wins whenever it has rows in the window.
+    totals = {"wan": (10, 20), "wan-host": (10, 0), "wan-ctr": (0, 20), "eth0": (999, 999)}
+    meter, note = m.wan_meter(totals, "eth0")
+    check("wan_meter prefers the nft series", meter == "wan")
+    check("wan_meter labels the nft series", "LAN excluded" in note)
+    meter, note = m.wan_meter({"eth0": (5, 5)}, "eth0")
+    check("wan_meter falls back to the NIC", meter == "eth0")
+    check("wan_meter labels the fallback loudly", "LAN INCLUDED" in note)
+
+    # nft_deltas: reset tolerance + zero rows survive + no-baseline safety.
+    prev = {"wan": (100, 200), "wan-host": (100, 0), "wan-ctr": (0, 200)}
+    cur = {"wan": (150, 200), "wan-host": (150, 0), "wan-ctr": (0, 200)}
+    d = m.nft_deltas(prev, cur)
+    check("nft_deltas computes plain deltas", d["wan"] == (50, 0))
+    check("nft_deltas keeps zero rows", d["wan-ctr"] == (0, 0))
+    d = m.nft_deltas(prev, {"wan": (5, 3), "wan-host": (5, 3), "wan-ctr": (0, 0)})
+    check("nft_deltas treats a counter reset as the current value", d["wan"] == (5, 3))
+    d = m.nft_deltas({}, cur)
+    check("nft_deltas yields zero without a baseline", d["wan"] == (0, 0))
+
+    # read_nft_wan: parse the -j shape, sum wan, degrade to {} on failures.
+    fake = {"nftables": [
+        {"metainfo": {}},
+        {"counter": {"family": "inet", "name": "host_in", "table": "bwmon", "bytes": 7, "packets": 1}},
+        {"counter": {"family": "inet", "name": "host_out", "table": "bwmon", "bytes": 11, "packets": 1}},
+        {"counter": {"family": "inet", "name": "ctr_in", "table": "bwmon", "bytes": 3, "packets": 1}},
+        {"counter": {"family": "inet", "name": "ctr_out", "table": "bwmon", "bytes": 5, "packets": 1}},
+    ]}
+
+    class FakeProc:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    orig_run = m.subprocess.run
+    try:
+        m.subprocess.run = lambda *a, **k: FakeProc(0, json.dumps(fake))
+        got = m.read_nft_wan()
+        check("read_nft_wan maps the counters",
+              got["wan-host"] == (7, 11) and got["wan-ctr"] == (3, 5))
+        check("read_nft_wan sums wan", got["wan"] == (10, 16))
+        m.subprocess.run = lambda *a, **k: FakeProc(1, "")
+        check("read_nft_wan degrades to {} on rc!=0", m.read_nft_wan() == {})
+        m.subprocess.run = lambda *a, **k: FakeProc(0, "not json")
+        check("read_nft_wan degrades to {} on bad json", m.read_nft_wan() == {})
+        missing = {"nftables": fake["nftables"][:3]}
+        m.subprocess.run = lambda *a, **k: FakeProc(0, json.dumps(missing))
+        check("read_nft_wan degrades to {} on missing counters", m.read_nft_wan() == {})
+    finally:
+        m.subprocess.run = orig_run
+        m._nft_last_complaint[0] = None
+
+
+
 if __name__ == "__main__":
     test_crypto()
     test_formatting()
@@ -298,6 +354,7 @@ if __name__ == "__main__":
     test_router_logic()
     test_router_integration()
     test_review_fixes()
+    test_wan_meter()
     print()
     print("ALL PASS" if not _fails else f"{len(_fails)} FAILURES: {_fails}")
     sys.exit(1 if _fails else 0)

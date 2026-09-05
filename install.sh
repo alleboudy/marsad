@@ -69,6 +69,28 @@ install -d -m 750 "$CONF_DIR"
 install -m 644 "$SRC_DIR/marsad@.service" "$UNIT_DIR/marsad@.service"
 systemctl daemon-reload
 
+# --- WAN/LAN-split counters (host mode) --------------------------------------
+# On a box whose uplink NIC also carries LAN, NIC counters over-report; the
+# address-based nftables counters give marsad a LAN-excluded WAN meter. If a
+# bwmon-wan-counters.service already provides the `inet bwmon` table (the
+# idrisi-dev original), leave it in charge — marsad reads the same table.
+install_wan_counters() {
+  command -v nft >/dev/null 2>&1 || {
+    echo "nft not found — no WAN/LAN split; marsad will meter the NIC (LAN included)."
+    return 0
+  }
+  if systemctl cat bwmon-wan-counters.service >/dev/null 2>&1; then
+    echo "bwmon-wan-counters.service already provides the inet bwmon table — skipping marsad's copy."
+    return 0
+  fi
+  install -m 644 "$SRC_DIR/wan-counters.nft" "$CONF_DIR/wan-counters.nft"
+  install -m 644 "$SRC_DIR/marsad-wan-counters.service" "$UNIT_DIR/marsad-wan-counters.service"
+  systemctl daemon-reload
+  systemctl enable --now marsad-wan-counters.service \
+    && echo "WAN counters loaded (address-based, LAN excluded)."
+}
+case " ${INSTANCES[*]} " in *" host "*) install_wan_counters ;; esac
+
 # --- per-instance ------------------------------------------------------------
 install_instance() {
   local name="$1" mode port default_cap state envf

@@ -1,0 +1,14 @@
+[Unit]
+Description=marsad WAN accounting counters (nftables, address-based)
+After=network-pre.target
+Wants=network-pre.target
+Before=marsad@host.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/marsad/wan-counters.nft
+ExecStop=/usr/sbin/nft delete table inet bwmon
+
+[Install]
+WantedBy=multi-user.target

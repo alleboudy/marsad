@@ -1,0 +1,86 @@
+#!/usr/sbin/nft -f
+#
+# marsad WAN accounting — counters only, never a verdict.
+#
+# Why: on a box whose uplink NIC also carries LAN, "bytes on the NIC" is not
+# "bytes over the metered link" — every LAN byte lands on the metered number.
+# These counters bill by ADDRESS, not by interface, so they survive an uplink
+# move (WiFi today, wired tomorrow) that silently blinds an interface-pinned
+# ruleset. Anything addressed to a private/CGNAT/link-local peer is free;
+# everything else is WAN, whichever NIC carries it.
+#
+# Host traffic is counted at the output/input hooks; NAT-forwarded container
+# traffic at the forward hook (the only place the container address is still
+# visible). A packet traverses exactly one of those paths — no double count.
+#
+# Everything is `policy accept` + bare `counter` at a late priority, so it
+# cannot filter, reorder, or interact with docker's rules. Safe on live infra.
+#
+# The table name stays `bwmon` — existing consumers (idrisi-bwmon,
+# ci-bw-guard, marsad) all read `inet bwmon` and keep working unchanged.
+
+table inet bwmon
+delete table inet bwmon
+
+table inet bwmon {
+    set private4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            10.0.0.0/8,
+            172.16.0.0/12,
+            192.168.0.0/16,
+            100.64.0.0/10,      # CGNAT — tailscale's tailnet range
+            127.0.0.0/8,
+            169.254.0.0/16,
+            224.0.0.0/4,
+            255.255.255.255/32,
+        }
+    }
+    set private6 {
+        type ipv6_addr
+        flags interval
+        elements = {
+            ::1/128,
+            fc00::/7,           # ULA
+            fe80::/10,          # link-local
+            ff00::/8,           # multicast
+        }
+    }
+
+    # Per-remote-peer inbound accounting ("what should we cache?").
+    # 36h timeout covers a full nightly plus a working day.
+    set peers4 { type ipv4_addr; size 16384; flags dynamic; timeout 36h; counter; }
+    set peers6 { type ipv6_addr; size 16384; flags dynamic; timeout 36h; counter; }
+
+    counter host_out   {}   # host processes -> internet
+    counter host_in    {}
+    counter ctr_out    {}   # NAT-forwarded (containers/VMs) -> internet
+    counter ctr_in     {}
+
+    chain hostout {
+        type filter hook output priority 300; policy accept;
+        ip daddr @private4 return
+        ip6 daddr @private6 return
+        counter name "host_out"
+    }
+
+    chain hostin {
+        type filter hook input priority 300; policy accept;
+        ip saddr @private4 return
+        ip6 saddr @private6 return
+        counter name "host_in"
+        ip  saddr != @private4 update @peers4 { ip saddr }
+        ip6 saddr != @private6 update @peers6 { ip6 saddr }
+    }
+
+    chain ctrfwd {
+        type filter hook forward priority 300; policy accept;
+        ip  daddr != @private4 counter name "ctr_out"
+        ip6 daddr != @private6 counter name "ctr_out"
+        ip  saddr != @private4 counter name "ctr_in"
+        ip6 saddr != @private6 counter name "ctr_in"
+        ip  saddr != @private4 update @peers4 { ip saddr }
+        ip6 saddr != @private6 update @peers6 { ip6 saddr }
+    }
+}
