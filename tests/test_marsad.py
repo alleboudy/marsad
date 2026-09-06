@@ -347,6 +347,31 @@ def test_wan_meter():
 
 
 
+
+
+def test_platform_and_lan_helpers():
+    sample = """Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+lo0        16384 <Link#1>                      483958     0 2480054191 483958     0 2480054191     0
+lo0        16384 127           127.0.0.1       483958     - 2480054191 483958     - 2480054191     -
+gif0*      1280  <Link#2>                             0     0          0        0     0          0     0
+en0        1500  <Link#4>      aa:bb:cc:dd:ee:ff 111 0 5000 222 0 7000 0
+"""
+    got = m.parse_darwin_netstat(sample)
+    check("darwin parse takes the Link rows only", set(got) == {"lo0", "gif0", "en0"})
+    check("darwin parse reads en0 bytes from the tail", got["en0"] == (5000, 7000))
+    check("darwin parse strips the down-iface star", "gif0" in got)
+
+    extra = m.parse_extra_counters("winhost 123 456\nbad line here\nx 1 notanum\n")
+    check("extra counters parse the good line", extra == {"winhost": (123, 456)})
+
+    check("lan_delta subtracts wan from the NIC", m.lan_delta((100, 60), (30, 10)) == (70, 50))
+    check("lan_delta clamps at zero", m.lan_delta((10, 5), (30, 10)) == (0, 0))
+
+    cfg = m.load_config()
+    check("lan_cap_gb defaults on", cfg["lan_cap_gb"] == 2.0)
+    check("extra_counters_cmd defaults empty", cfg["extra_counters_cmd"] == "")
+
+
 if __name__ == "__main__":
     test_crypto()
     test_formatting()
@@ -355,6 +380,7 @@ if __name__ == "__main__":
     test_router_integration()
     test_review_fixes()
     test_wan_meter()
+    test_platform_and_lan_helpers()
     print()
     print("ALL PASS" if not _fails else f"{len(_fails)} FAILURES: {_fails}")
     sys.exit(1 if _fails else 0)

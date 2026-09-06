@@ -69,6 +69,8 @@ DEFAULTS = {
     "report_interval_min": 60,     # how often a digest is sent (live)
     "summary_window_min": 60,      # how much history each digest + the cap covers (live)
     "cap_gb": 5.0,                 # alert if the summary window exceeds this many GB (0 = off, live)
+    "lan_cap_gb": 2.0,             # BLUE alert when intra-network (LAN) traffic exceeds this per window (0 = off, live)
+    "extra_counters_cmd": "",      # optional command printing "name rx_bytes tx_bytes" cumulative lines (restart)
     "cap_cooldown_min": 30,        # min minutes between cap alerts (live)
     "sample_interval_sec": 60,     # how often counters are sampled (live)
     "nethogs_delay_sec": 5,        # nethogs refresh granularity (re-applied on change)
@@ -114,7 +116,7 @@ _NFT_COUNTER_MAP = {
     "host_in": (WAN_HOST_IFACE, 0), "host_out": (WAN_HOST_IFACE, 1),
     "ctr_in": (WAN_CTR_IFACE, 0), "ctr_out": (WAN_CTR_IFACE, 1),
 }
-LIVE_KEYS = ("report_interval_min", "summary_window_min", "cap_gb",
+LIVE_KEYS = ("report_interval_min", "summary_window_min", "cap_gb", "lan_cap_gb",
              "cap_cooldown_min", "sample_interval_sec", "resolve_names",
              "projection_window_min", "graph_window_min", "stop_top_n", "stop_grace_sec",
              "router_poll_sec", "router_auth_fail_limit", "router_lockout_backoff_min",
@@ -126,6 +128,7 @@ CLAMP = {
     "report_interval_min": (1, 1440),
     "summary_window_min": (1, 10080),
     "cap_gb": (0.0, 100000.0),
+    "lan_cap_gb": (0.0, 100000.0),
     "cap_cooldown_min": (1, 1440),
     "sample_interval_sec": (10, 3600),
     "nethogs_delay_sec": (1, 60),
@@ -252,6 +255,10 @@ def env_value(key):
 # --------------------------------------------------------------------------- #
 def detect_uplink():
     """Interface holding the default route, or None if not yet resolvable."""
+    if sys.platform == "darwin":
+        out = run(["route", "-n", "get", "default"])
+        m = re.search(r"interface:\s*(\S+)", out)
+        return m.group(1) if m else None
     out = run(["ip", "route", "get", "1.1.1.1"])
     m = re.search(r"\bdev\s+(\S+)", out)
     return m.group(1) if m else None
@@ -261,6 +268,55 @@ def tailscale_ip():
     out = run(["ip", "-4", "-o", "addr", "show", "tailscale0"])
     m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
     return m.group(1) if m else None
+
+
+def parse_darwin_netstat(text):
+    """Parse `netstat -ib -n` link rows into {iface: (rx_bytes, tx_bytes)}.
+
+    Only the `<Link#N>` row carries the per-interface totals; the per-address
+    rows repeat them. The link row has ten or eleven fields (the MAC address
+    is absent on lo0), so index from the tail: Ibytes is field -5 and Obytes
+    is field -2."""
+    res = {}
+    for line in text.splitlines():
+        if "<Link#" not in line:
+            continue
+        f = line.split()
+        if len(f) < 10:
+            continue
+        try:
+            res[f[0].rstrip("*")] = (int(f[-5]), int(f[-2]))
+        except ValueError:
+            continue
+    return res
+
+
+def read_darwin_counters():
+    return parse_darwin_netstat(run(["netstat", "-ib", "-n"], timeout=10))
+
+
+def parse_extra_counters(text):
+    """Parse `name rx_bytes tx_bytes` cumulative lines from the optional
+    extra-counters command (e.g. a WSL box polling its Windows host's
+    adapter through interop). Bad lines are skipped, never fatal."""
+    res = {}
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) != 3 or not IFACE_RE.fullmatch(f[0]):
+            continue
+        try:
+            res[f[0]] = (int(f[1]), int(f[2]))
+        except ValueError:
+            continue
+    return res
+
+
+def lan_delta(uplink_delta, wan_delta):
+    """Intra-network bytes = what crossed the uplink NIC minus what left for
+    the internet. Clamped at zero: counter timing skew must never mint a
+    negative byte."""
+    return (max(0, uplink_delta[0] - wan_delta[0]),
+            max(0, uplink_delta[1] - wan_delta[1]))
 
 
 def read_proc_net_dev():
@@ -730,7 +786,7 @@ def midnight_epoch():
 
 def _host_digest_block(lines, store, cfg, uplink, iface, since, up_rx, up_tx):
     others = [(i, v) for i, v in iface.items()
-              if i != uplink and i not in PSEUDO_IFACES and not is_intrahost(i)
+              if i != uplink and i not in PSEUDO_IFACES and i != "lan" and not is_intrahost(i)
               and (v[0] + v[1]) > 1024 * 1024]
     if others:
         others.sort(key=lambda x: -(x[1][0] + x[1][1]))
@@ -808,6 +864,10 @@ def build_digest(store, cfg, uplink, window_min, extras=None):
     if not router and meter == WAN_IFACE and uplink in iface:
         n = iface[uplink]
         lines.append(f"uplink NIC {slack_escape(uplink)} incl. LAN:  Σ {human(n[0] + n[1])}")
+    if not router and "lan" in iface:
+        l = iface["lan"]
+        lines.append(f"LAN (intra-network):  ⬇ {human(l[0])} down   ⬆ {human(l[1])} up   "
+                     f"Σ {human(l[0] + l[1])} — becomes WAN if this node moves out")
 
     day = store.iface_totals(midnight_epoch()).get(meter, (0, 0))
     lines.append(f"today so far:  ⬇ {human(day[0])} down   ⬆ {human(day[1])} up   "
@@ -874,8 +934,10 @@ class HostCollector(Collector):
         self.uplink = self._resolve_uplink()
         self.labeler = Labeler()
         self.nethogs = NethogsReader(self.uplink or "lo", cfg["nethogs_delay_sec"])
-        self._last_counters = read_proc_net_dev()
+        self._read_counters = read_darwin_counters if sys.platform == "darwin" else read_proc_net_dev
+        self._last_counters = self._read_counters()
         self._last_nft = read_nft_wan()
+        self._last_extra = {}
         self._started = False
         self._pid_acc = {}      # (path, pid:int) -> [w_sent, w_recv], decayed each cycle
 
@@ -898,7 +960,7 @@ class HostCollector(Collector):
         return self.uplink
 
     def sample(self):
-        cur = read_proc_net_dev()
+        cur = self._read_counters()
         deltas = {}
         for iface, (rx, tx) in cur.items():
             prev = self._last_counters.get(iface)
@@ -919,6 +981,19 @@ class HostCollector(Collector):
             # Zero rows included on purpose — see nft_deltas.
             deltas.update(nft_deltas(self._last_nft, cur_nft))
             self._last_nft = cur_nft
+            # Intra-network bytes: the uplink NIC carries LAN + WAN; the nft
+            # counters isolate WAN; the difference is the LAN share. This is
+            # the figure that turns into WAN if the node leaves the network.
+            if self.uplink:
+                up = deltas.get(self.uplink, (0, 0))
+                deltas["lan"] = lan_delta(up, deltas.get(WAN_IFACE, (0, 0)))
+
+        cmd = self.cfg.get("extra_counters_cmd", "")
+        if cmd:
+            cur_extra = parse_extra_counters(run(["bash", "-c", cmd], timeout=10))
+            if cur_extra:
+                deltas.update(nft_deltas(self._last_extra, cur_extra))
+                self._last_extra = cur_extra
 
         drained = self.nethogs.drain()
         proc_weights = {}
@@ -1788,6 +1863,7 @@ class Daemon:
         log(f"host={HOST} mode={self.cfg['mode']} target={self.collector.target_label()}")
         self._last_report = self.store.get_meta("last_report", 0.0)
         self._last_cap_alert = self.store.get_meta("last_cap_alert", 0.0)
+        self._last_lan_alert = self.store.get_meta("last_lan_alert", 0.0)
         # defer the first prune ~1h: nothing to prune on a fresh/just-loaded DB, and
         # a checkpoint(TRUNCATE) right after the first write trips SQLITE_LOCKED.
         self._last_prune = time.time()
@@ -1863,6 +1939,34 @@ class Daemon:
         else:
             log(f"CAP HIT but Slack delivery FAILED ({total_gb:.2f}GB) — will retry next cycle")
 
+    def check_lan_cap(self):
+        cap = self.cfg.get("lan_cap_gb", 0)
+        if cap <= 0 or self.cfg["mode"] in ("router", "network"):
+            return
+        win = self.cfg["summary_window_min"]
+        since = int(time.time()) - win * 60
+        rx, tx = self.store.iface_totals(since).get("lan", (0, 0))
+        total_gb = (rx + tx) / (1024 ** 3)
+        if total_gb < cap:
+            return
+        if time.time() - self._last_lan_alert < self.cfg["cap_cooldown_min"] * 60:
+            return
+        # Blue on purpose: LAN bytes are free today. The lamp says what to
+        # EXPECT on the metered link if this node leaves the network.
+        ok = post_slack(
+            f":large_blue_circle: *{HOST} LAN TRAFFIC HIGH* — "
+            f"{total_gb:.2f} GB intra-network in the last {win} min (cap {cap} GB).\n"
+            f"⬇ {human(rx)} down  ⬆ {human(tx)} up.  Free bytes today — "
+            f"this volume lands on the metered link if {HOST} moves out of the network.",
+            self.cfg.get("slack_channel") or None,
+        )
+        if ok:
+            self._last_lan_alert = time.time()
+            self.store.set_meta("last_lan_alert", self._last_lan_alert)
+            log(f"LAN ALERT sent: {total_gb:.2f}GB > {cap}GB in {win}min")
+        else:
+            log(f"LAN HIGH but Slack delivery FAILED ({total_gb:.2f}GB) — will retry next cycle")
+
     def maybe_report(self):
         interval = self.cfg["report_interval_min"] * 60
         if self._last_report == 0.0:
@@ -1892,6 +1996,7 @@ class Daemon:
                 self.maybe_retarget()
                 self.sample()
                 self.check_cap()
+                self.check_lan_cap()
                 self.maybe_report()
                 self.maybe_prune()
             except Exception as e:  # noqa: BLE001
