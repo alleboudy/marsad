@@ -23,6 +23,11 @@ You can run both at once as two systemd instances (`marsad@host` + `marsad@netwo
 - **Stop top consumers** (host) — a panel button that SIGTERM→SIGKILLs the *daemon-computed* heaviest local processes, with a hard allowlist that never touches critical processes.
 - **Live admin panel** — view current/window/today usage + the graph + top talkers (host) or connected devices (router), and change knobs without a restart. Optional admin-token auth.
 - **Hardened** — tight systemd sandbox (minimal capabilities, `ProtectSystem=strict`, private state dir, 0600 secrets); the router instance runs fully unprivileged.
+- **LAN-excluded WAN meter** (host, Linux) — when the address-based `inet bwmon` nftables counters are loaded (`wan-counters.nft` ships in this repo), the cap and digest bill true WAN (`wan`/`wan-host`/`wan-ctr` pseudo-interfaces); the NIC stays as a loudly-labelled fallback. Survives an uplink move — the counters match peer addresses, never interface names.
+- **LAN series + blue lamp** (host, Linux) — a `lan` pseudo-interface (uplink NIC minus WAN) with its own `lan_cap_gb` (default 2 GB/window) raising a **blue** Slack alert: free bytes today, but the volume that lands on the metered link if the node leaves the network.
+- **macOS host mode** — the same daemon runs on a Mac (`netstat -ib` counters, `route -n get default` uplink); no nftables there, so the meter is NIC-level and says so. `MARSAD_LABEL` names the node in every Slack line.
+- **External counters hook** — `extra_counters_cmd` ingests cumulative `name rx tx` lines from any command; the shipped example is a WSL box polling its **Windows host's** Wi-Fi adapter through PowerShell interop, so the Windows half of a dual-boot/WSL machine stops being a blind spot.
+- **Per-host aggregation** (router mode) — `agent_endpoints` polls the host instances' `/api/stats` and the digest ranks instrumented hosts, with an honest "other / uninstrumented" residual.
 
 ---
 
