@@ -250,6 +250,11 @@ def env_value(key):
     return None
 
 
+# systemd exports the env file into the process; launchd does not. Resolve
+# the label again now that env_value can read MARSAD_ENV directly.
+HOST = os.environ.get("MARSAD_LABEL") or env_value("MARSAD_LABEL") or HOST
+
+
 # --------------------------------------------------------------------------- #
 # Network helpers
 # --------------------------------------------------------------------------- #
